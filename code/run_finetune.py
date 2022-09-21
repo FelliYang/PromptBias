@@ -104,7 +104,7 @@ if __name__ == "__main__":
         logger.info('Valid batches: %d'%len(valid_samples_batches))
 
         # Valid set before train
-        best_result, result_rel = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
+        best_result = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
         save_model(model, args)
 
         param_optimizer = list(model.mlm_model.named_parameters())
@@ -156,10 +156,9 @@ if __name__ == "__main__":
                 if eval_step > 0 and (global_step + 1) % eval_step == 0:
                     # Eval during training
                     logger.info('Global step=%d, evaluating...'%(global_step))
-                    precision, current_result = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
+                    precision = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
                     if precision > best_result:
                         best_result = precision
-                        result_per = current_result
                         logger.info('!!! Best valid (epoch=%d): %.2f' %
                             (_, best_result * 100))
                         save_model(model, args)

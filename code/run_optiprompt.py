@@ -1,93 +1,27 @@
-import json
 import argparse
+import json
+import logging
 import os
 import random
 import sys
-import logging
-from tqdm import tqdm
-
-import torch
-from torch import optim
-
-from models import Prober
-from utils import load_vocab, load_data, batchify, evaluate, get_relation_meta
 
 import numpy as np
+import torch
+from torch import optim
+from tqdm import tqdm
+from transformers import (AdamW, BertForMaskedLM,
+                          get_linear_schedule_with_warmup)
 
-from transformers import AdamW, get_linear_schedule_with_warmup
-
-MAX_NUM_VECTORS = 10
+from models import Prober
+from utils import *
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_new_token(vid):
-    assert(vid > 0 and vid <= MAX_NUM_VECTORS)
-    return '[V%d]'%(vid)
-
-def convert_manual_to_dense(manual_template, model):
-    def assign_embedding(new_token, token):
-        """
-        assign the embedding of token to new_token
-        """
-        logger.info('Tie embeddings of tokens: (%s, %s)'%(new_token, token))
-        id_a = model.tokenizer.convert_tokens_to_ids([new_token])[0]
-        id_b = model.tokenizer.convert_tokens_to_ids([token])[0]
-        with torch.no_grad():
-            model.base_model.embeddings.word_embeddings.weight[id_a] = model.base_model.embeddings.word_embeddings.weight[id_b].detach().clone()
-
-    new_token_id = 0
-    template = []
-    for word in manual_template.split():
-        if word in ['[X]', '[Y]']:
-            template.append(word)
-        else:
-            tokens = model.tokenizer.tokenize(' ' + word)
-            for token in tokens:
-                new_token_id += 1
-                template.append(get_new_token(new_token_id))
-                assign_embedding(get_new_token(new_token_id), token)
-
-    return ' '.join(template)
-
-def init_template(args, model):
-    if args.init_manual_template:
-        relation = get_relation_meta(args)
-        template = convert_manual_to_dense(relation['template'], model)
-    else:
-        template = '[X] ' + ' '.join(['[V%d]'%(i+1) for i in range(args.num_vectors)]) + ' [Y] .'
-    return template
-
-def prepare_for_dense_prompt(model):
-    new_tokens = [get_new_token(i+1) for i in range(MAX_NUM_VECTORS)]
-    model.tokenizer.add_tokens(new_tokens)
-    ebd = model.mlm_model.resize_token_embeddings(len(model.tokenizer))
-    logger.info('# vocab after adding new tokens: %d'%len(model.tokenizer))
-
-def save_optiprompt(args, model, original_vocab_size):
-    logger.info("Saving OptiPrompt's [V]s..")
-    vs = model.base_model.embeddings.word_embeddings.weight[original_vocab_size:].detach().cpu().numpy()
-    with open(os.path.join(args.output_dir, 'prompt_vecs.npy'), 'wb') as f:
-        np.save(f, vs)
-
-def load_optiprompt(args):
-    # load bert model (pre-trained)
-    model = Prober(args, random_init=args.random_init)
-    original_vocab_size = len(list(model.tokenizer.get_vocab()))
-    prepare_for_dense_prompt(model)
-    
-    logger.info("Loading OptiPrompt's [V]s..")
-    with open(os.path.join(args.output_dir, 'prompt_vecs.npy'), 'rb') as f:
-        vs = np.load(f)
-    
-    # copy fine-tuned new_tokens to the pre-trained model
-    with torch.no_grad():
-        model.base_model.embeddings.word_embeddings.weight[original_vocab_size:] = torch.Tensor(vs)
-    return model
-
 if __name__ == "__main__":
+    # setting initialization
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='bert-base-cased', help='the huggingface model name')
     parser.add_argument('--model_dir', type=str, default=None, help='the model directory (if not using --model_name)')
@@ -113,7 +47,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--seed', type=int, default=6)
 
-    parser.add_argument('--relation', type=str, required=True, help='which relation is considered in this run')
+    parser.add_argument('--relation_train', nargs="+", required=True, help='which relation is considered in this training')
+    parser.add_argument('--relation_test', nargs="+", required=True, help='which relation is considered in this test')
     parser.add_argument('--init_manual_template', action='store_true', help='whether to use manual template to initialize the dense vectors')
     parser.add_argument('--random_init', type=str, default='none', choices=['none', 'embedding', 'all'], help='none: use pre-trained model; embedding: random initialize the embedding layer of the model; all: random initialize the whole model')
     parser.add_argument('--num_vectors', type=int, default=5, help='how many dense vectors are used in OptiPrompt')
@@ -123,6 +58,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
     if args.do_train:
         logger.addHandler(logging.FileHandler(os.path.join(args.output_dir, "train.log"), 'w'))
     else:
@@ -142,6 +80,7 @@ if __name__ == "__main__":
     if torch.cuda.device_count() > 1:
         torch.cuda.manual_seed_all(args.seed)
 
+    # start to define model
     model = Prober(args, random_init=args.random_init)
     original_vocab_size = len(list(model.tokenizer.get_vocab()))
     logger.info('Original vocab size: %d'%original_vocab_size)
@@ -163,16 +102,18 @@ if __name__ == "__main__":
 
     if args.do_train:
         # Prepare train/valid data
-        train_samples = load_data(args.train_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
+        train_data = [ args.train_data + r + "/train.jsonl" for r in args.relation_train ]
+        dev_data = [ args.train_data + r + "/dev.jsonl" for r in args.relation_train ]
+        train_samples = load_data(train_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
         train_samples_batches, train_sentences_batches = batchify(train_samples, args.train_batch_size * max(n_gpu, 1))
         logger.info('Train batches: %d'%len(train_samples_batches))
-        valid_samples = load_data(args.dev_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
+        valid_samples = load_data(dev_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
         valid_samples_batches, valid_sentences_batches = batchify(valid_samples, args.eval_batch_size * max(n_gpu, 1))
         logger.info('Valid batches: %d'%len(valid_samples_batches))
 
         # Valid set before train
-        best_result, result_rel = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
-        save_optiprompt(args, model, original_vocab_size)
+        best_result = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
+        save_optiprompt(args.output_dir, model, original_vocab_size)
 
         # Add word embeddings to the optimizer
         optimizer = AdamW([{'params': model.base_model.embeddings.word_embeddings.parameters()}], lr=args.learning_rate, correct_bias=False)
@@ -221,19 +162,18 @@ if __name__ == "__main__":
                 if eval_step > 0 and (global_step + 1) % eval_step == 0:
                     # Eval during training
                     logger.info('Global step=%d, evaluating...'%(global_step))
-                    precision, current_result = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
+                    precision = evaluate(model, valid_samples_batches, valid_sentences_batches, filter_indices, index_list)
                     if precision > best_result:
                         best_result = precision
-                        result_per = current_result
                         logger.info('!!! Best valid (epoch=%d): %.2f' %
                             (_, best_result * 100))
-                        save_optiprompt(args, model, original_vocab_size)
+                        save_optiprompt(args.output_dir, model, original_vocab_size)
         logger.info('Best Valid: %.2f'%(best_result*100))
 
     if args.do_eval:
-        model = load_optiprompt(args)
-
-        eval_samples = load_data(args.test_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
+        test_data = [ args.test_data + r + "/test.jsonl" for r in args.relation_test ]
+        model = load_optiprompt(args, os.path.join(args.output_dir,"prompt_vecs.npy"))
+        eval_samples = load_data(test_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
         eval_samples_batches, eval_sentences_batches = batchify(eval_samples, args.eval_batch_size * max(n_gpu, 1))
         
         evaluate(model, eval_samples_batches, eval_sentences_batches, filter_indices, index_list, output_topk=args.output_dir if args.output_predictions else None)

@@ -1,3 +1,4 @@
+from imp import load_module
 import json
 import argparse
 import os
@@ -8,7 +9,7 @@ from tqdm import tqdm
 import torch
 
 from models import Prober
-from utils import load_vocab, load_data, batchify, save_model, evaluate, get_relation_meta
+from utils import *
 
 from transformers import AdamW, get_linear_schedule_with_warmup
 
@@ -17,9 +18,6 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def init_template(args, model):
-    relation = get_relation_meta(args)
-    return relation['template']
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -34,14 +32,20 @@ if __name__ == "__main__":
 
     parser.add_argument('--seed', type=int, default=6)
 
-    parser.add_argument('--relation', type=str, required=True, help='which relation is considered in this run')
+    parser.add_argument('--relation_test', nargs="+", type=str, required=True, help='which relation is considered in this run')
     parser.add_argument('--random_init', type=str, default='none', choices=['none', 'embedding', 'all'], help='none: use pre-trained model; embedding: random initialize the embedding layer of the model; all: random initialize the whole model')
 
     parser.add_argument('--output_predictions', action='store_true', help='whether to output top-k predictions')
     parser.add_argument('--k', type=int, default=5, help='how many predictions will be outputted')
 
-    args = parser.parse_args()
+    parser.add_argument("--ckpt_path",required="True",type=str,default="none", help="specify the model ckpt used to evaluate")
+    parser.add_argument('--num_vectors', type=int, default=5, help='how many dense vectors are used in OptiPrompt')
+    parser.add_argument('--init_manual_template', action='store_true', help='whether to use manual template to initialize the dense vectors')
 
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
     logger.addHandler(logging.FileHandler(os.path.join(args.output_dir, "eval.log"), 'w'))
 
     logger.info(args)
@@ -58,7 +62,7 @@ if __name__ == "__main__":
     if torch.cuda.device_count() > 1:
         torch.cuda.manual_seed_all(args.seed)
 
-    model = Prober(args, random_init=args.random_init)
+    model = load_optiprompt(args)
 
     if args.common_vocab_filename is not None:
         vocab_subset = load_vocab(args.common_vocab_filename)
@@ -74,6 +78,8 @@ if __name__ == "__main__":
     template = init_template(args, model)
     logger.info('Template: %s'%template)
 
-    eval_samples = load_data(args.test_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
+
+    test_data = [ args.test_data + r + "/test.jsonl" for r in args.relation_test ]
+    eval_samples = load_data(test_data, template, vocab_subset=vocab_subset, mask_token=model.MASK)
     eval_samples_batches, eval_sentences_batches = batchify(eval_samples, args.eval_batch_size * n_gpu)
     evaluate(model, eval_samples_batches, eval_sentences_batches, filter_indices, index_list, output_topk=args.output_dir if args.output_predictions else None)

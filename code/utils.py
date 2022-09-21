@@ -1,3 +1,4 @@
+from email.parser import Parser
 import json
 import os
 from tqdm import tqdm
@@ -5,6 +6,11 @@ import sys
 import logging
 
 logger = logging.getLogger(__name__)
+from models import Prober
+import torch
+import numpy as np
+
+MAX_NUM_VECTORS = 10
 
 def load_vocab(vocab_filename):
     with open(vocab_filename, "r") as f:
@@ -70,6 +76,7 @@ def save_model(model, args):
     model.tokenizer.save_pretrained(args.output_dir)
 
 def output_result(result, eval_loss):
+    # descrepted
     logger.info('* Evaluation result *')
     cor = 0
     tot = 0
@@ -90,7 +97,23 @@ def output_result(result, eval_loss):
     sys.stdout.flush()
     return micro, macro
 
-def evaluate(model, samples_batches, sentences_batches, filter_indices=None, index_list=None, output_topk=None):
+def output_result_simple(result, eval_loss):
+    logger.info('* Evaluation result *')
+    cor = 0
+    tot = 0
+    loss = 0.0
+    for rel in result:
+        cor_, tot_, avg_, loss_ = result[rel]
+        cor += cor_
+        tot += tot_
+        loss += loss_
+        loss_ /= tot_
+        logger.info('%s\t%.5f\t%d\t%d\t%.5f' % (rel, avg_, cor_, tot_, loss_))
+    logger.info('Eval_loss: %.5f, Eval_loss (common vocab): %.5f' %(eval_loss / tot, loss / tot if len(result) > 0 else 0.0))
+    sys.stdout.flush()
+    return cor/tot
+
+def evaluate(model:Prober, samples_batches, sentences_batches, filter_indices=None, index_list=None, output_topk=None):
     vocab_to_common_vocab = None
     if index_list is not None:
         vocab_to_common_vocab = {}
@@ -103,14 +126,14 @@ def evaluate(model, samples_batches, sentences_batches, filter_indices=None, ind
     list_of_predictions = {}
     eval_loss = 0.0
     common_eval_loss = 0.0
+    filtered_examples_num = 0
+
     for i in tqdm(range(len(samples_batches))):
         samples_b = samples_batches[i]
         sentences_b = sentences_batches[i]
-
-        log_probs, cor_b, tot_b, pred_b, topk_preds, loss, common_vocab_loss = model.run_batch(sentences_b, samples_b, training=False, filter_indices=filter_indices, index_list=index_list, vocab_to_common_vocab=vocab_to_common_vocab)
+        log_probs, cor_b, tot_b, pred_b, topk_preds, loss, common_vocab_loss = model.run_batch(sentences_b, samples_b, training=False, filter_indices=filter_indices, index_list=index_list, vocab_to_common_vocab=vocab_to_common_vocab, filtered_example_num=filtered_examples_num)
         cor_all += cor_b
         tot_all += tot_b
-
         for pred, sample, topk, vocab_loss in zip(pred_b, samples_b, topk_preds, common_vocab_loss):
             rel = sample['predicate_id']
             if rel not in result:
@@ -132,14 +155,17 @@ def evaluate(model, samples_batches, sentences_batches, filter_indices=None, ind
         
         eval_loss += loss.item() * tot_b
     
+    if filter_indices is not None  and filtered_examples_num>0:
+        logger.info(f"filtered {filtered_examples_num} example(s) in test cause common vocab")
+
     if output_topk is not None:
         logger.info('Output top-k prediction to %s..'%output_topk)
         for rel in list_of_predictions:
             with open(os.path.join(output_topk, '%s_predictions.jsonl'%rel), 'w') as f:
                 f.write('\n'.join([json.dumps(x) for x in list_of_predictions[rel]]))
-
-    micro, macro = output_result(result, eval_loss)
-    return micro, result
+    # result中包含 {relation :（corrent_prediction, total_prediction, c/t, relation_tot_loss）, xxx}
+    precion = output_result_simple(result, eval_loss)
+    return precion
 
 def gen_feature_sample(data_sample, template, mask_token='[MASK]'):
     feature_sample = {}
@@ -151,21 +177,108 @@ def gen_feature_sample(data_sample, template, mask_token='[MASK]'):
     feature_sample['input_sentences'] = [masked_sentence[0]]
     return feature_sample
 
-def load_data(data_path, template, vocab_subset=None, mask_token='[MASK]'):
+def load_data_one_relation(data_path, template, vocab_subset=None, mask_token='[MASK]'):
     all_samples = []
 
     distinct_facts = set()
     raw_samples = load_file(data_path)
+    filtered = 0
     for data_sample in raw_samples:
         # follow the LAMA setting, only keep distinct (sub, obj) pairs
         if (data_sample['sub_label'], data_sample['obj_label']) in distinct_facts:
             continue
         if (data_sample['obj_label'] not in vocab_subset):
+            filtered += 1
             continue
+        # assert data_sample['obj_label'] in vocab_subset
+
         distinct_facts.add((data_sample['sub_label'], data_sample['obj_label']))
 
         feature_sample = gen_feature_sample(data_sample, template, mask_token)
         all_samples.append(feature_sample)
 
+    logger.warning(f"filter {filtered} examples in load_data")
     return all_samples
 
+def get_new_token(vid):
+    assert(vid > 0 and vid <= MAX_NUM_VECTORS)
+    return '[V%d]'%(vid)
+
+def convert_manual_to_dense(manual_template, model):
+    def assign_embedding(new_token, token):
+        """
+        assign the embedding of token to new_token
+        """
+        logger.info('Tie embeddings of tokens: (%s, %s)'%(new_token, token))
+        id_a = model.tokenizer.convert_tokens_to_ids([new_token])[0]
+        id_b = model.tokenizer.convert_tokens_to_ids([token])[0]
+        with torch.no_grad():
+            model.base_model.embeddings.word_embeddings.weight[id_a] = model.base_model.embeddings.word_embeddings.weight[id_b].detach().clone()
+
+    new_token_id = 0
+    template = []
+    for word in manual_template.split():
+        if word in ['[X]', '[Y]']:
+            template.append(word)
+        else:
+            tokens = model.tokenizer.tokenize(' ' + word)
+            for token in tokens:
+                new_token_id += 1
+                template.append(get_new_token(new_token_id))
+                assign_embedding(get_new_token(new_token_id), token)
+
+    return ' '.join(template)
+
+def init_template(args, model):
+    # FIXME 由于args中使用的relation_train 为数组，因此不能直接用于手工template初始化
+    if args.init_manual_template:
+        relation = get_relation_meta(args)
+        template = convert_manual_to_dense(relation['template'], model)
+    else:
+        template = '[X] ' + ' '.join(['[V%d]'%(i+1) for i in range(args.num_vectors)]) + ' [Y] .'
+    return template
+
+def load_data(data_path, template, vocab_subset=None, mask_token='[MASK]'):
+    all_samples = []
+    if isinstance(data_path,list):
+        for r in data_path:
+            samples = load_data_one_relation(r, template, vocab_subset, mask_token)
+            all_samples += samples
+    else:
+        all_samples = load_data_one_relation(data_path, template, vocab_subset, mask_token)
+    return all_samples
+
+
+def prepare_for_dense_prompt(model):
+    new_tokens = [get_new_token(i+1) for i in range(MAX_NUM_VECTORS)]
+    model.tokenizer.add_tokens(new_tokens)
+    ebd = model.mlm_model.resize_token_embeddings(len(model.tokenizer))
+    logger.info('# vocab after adding new tokens: %d'%len(model.tokenizer))
+
+def save_optiprompt(save_path, model, original_vocab_size, save_name="prompt_vecs.npy"):
+    logger.info("Saving OptiPrompt's [V]s..")
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    vs = model.base_model.embeddings.word_embeddings.weight[original_vocab_size:].detach().cpu().numpy()
+    with open(os.path.join(save_path, save_name), 'wb') as f:
+        np.save(f, vs)
+
+
+
+def load_optiprompt(args, ckpt_path="none"):
+    # load bert model (pre-trained)
+    model = Prober(args, random_init=args.random_init)
+    original_vocab_size = len(list(model.tokenizer.get_vocab()))
+    prepare_for_dense_prompt(model)
+    
+    logger.info("Loading OptiPrompt's [V]s..")
+
+    if ckpt_path=="none": 
+        ckpt_path = args.ckpt_path
+    with open(ckpt_path, 'rb') as f:
+        vs = np.load(f)
+    
+    # copy fine-tuned new_tokens to the pre-trained model
+    with torch.no_grad():
+        model.base_model.embeddings.word_embeddings.weight[original_vocab_size:] = torch.Tensor(vs)
+    return model

@@ -80,7 +80,7 @@ class Prober():
         self._init_inverse_vocab()
 
         self.MASK = self.tokenizer.mask_token
-        self.EOS = self.tokenizer.eos_token
+        # self.EOS = self.tokenizer.eos_token
         self.CLS = self.tokenizer.cls_token
         self.SEP = self.tokenizer.sep_token
         self.UNK = self.tokenizer.unk_token
@@ -333,7 +333,7 @@ class Prober():
 
         return log_probs, token_ids_list, masked_indices_list
 
-    def run_batch(self, sentences_list, samples_list, try_cuda=True, training=True, filter_indices=None, index_list=None, vocab_to_common_vocab=None):
+    def run_batch(self, sentences_list, samples_list, try_cuda=True, training=True, filter_indices=None, index_list=None, vocab_to_common_vocab=None, filtered_example_num=None):
         if try_cuda and torch.cuda.device_count() > 0:
             self.try_cuda()
 
@@ -374,6 +374,10 @@ class Prober():
                 log_prob = log_probs[i][masked_index]
                 mlm_label = mlm_label_ids[i]
                 if filter_indices is not None:
+                    # 如果label不在这个词表里面，那么不可能正确，因此将这个信息打印出来
+                    if filtered_example_num and mlm_label in filter_indices:
+                        filtered_example_num += 1
+
                     log_prob = log_prob.index_select(dim=0, index=filter_indices)
                     pred_common_vocab = torch.argmax(log_prob)
                     pred = index_list[pred_common_vocab]
