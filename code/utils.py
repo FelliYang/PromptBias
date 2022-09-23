@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 from models import Prober
 import torch
 import numpy as np
+from torch.utils.data import DataLoader, Dataset
 
 MAX_NUM_VECTORS = 10
 
@@ -238,15 +239,55 @@ def init_template(args, model):
         template = '[X] ' + ' '.join(['[V%d]'%(i+1) for i in range(args.num_vectors)]) + ' [Y] .'
     return template
 
-def load_data(data_path, template, vocab_subset=None, mask_token='[MASK]'):
+
+
+def load_data(data_path:list, template, vocab_subset=None, mask_token='[MASK]', weight_sample = False):
+    """
+    load data only support load one relation one time
+    get the filtered data examples and the optional corrensponding sample weight use in train data,
+     which helps reduce the obj_label inbalance
+    """
+    assert len(data_path) == 1
     all_samples = []
-    if isinstance(data_path,list):
-        for r in data_path:
-            samples = load_data_one_relation(r, template, vocab_subset, mask_token)
-            all_samples += samples
-    else:
-        all_samples = load_data_one_relation(data_path, template, vocab_subset, mask_token)
-    return all_samples
+    weights = []
+
+    distinct_facts = set()
+    raw_samples = load_file(data_path[0])
+    filtered = 0
+    for data_sample in raw_samples:
+        # follow the LAMA setting, only keep distinct (sub, obj) pairs
+        if (data_sample['sub_label'], data_sample['obj_label']) in distinct_facts:
+            continue
+        if (data_sample['obj_label'] not in vocab_subset):
+            filtered += 1
+            continue
+        # assert data_sample['obj_label'] in vocab_subset
+
+        distinct_facts.add((data_sample['sub_label'], data_sample['obj_label']))
+
+        feature_sample = gen_feature_sample(data_sample, template, mask_token)
+        all_samples.append(feature_sample)
+
+    logger.warning(f"filter {filtered} examples in load_data")
+
+    if weight_sample:
+        # count the num of each obj_label in data
+        obj_count = {}
+        # record type of sample in dataset
+        type = []
+        for e in all_samples:
+            cls = e["obj_label"]
+            type.append(cls)
+            if not obj_count.__contains__(cls):
+                obj_count[cls] = 1
+            else:
+                obj_count[cls] += 1
+        
+        weights = [1 / obj_count[type[i]] for i in range(len(all_samples))] 
+        
+
+    return all_samples, weights
+
 
 
 def prepare_for_dense_prompt(model):
@@ -282,3 +323,15 @@ def load_optiprompt(args, ckpt_path="none"):
     with torch.no_grad():
         model.base_model.embeddings.word_embeddings.weight[original_vocab_size:] = torch.Tensor(vs)
     return model
+
+class PromptDataset(Dataset):
+    def __init__(self, data):
+        super().__init__()
+        self.data = data
+        self.length = len(self.data)
+    def __getitem__(self, index):
+        return self.data[index]
+    def __len__(self):
+        return self.length
+
+
