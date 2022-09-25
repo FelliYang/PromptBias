@@ -33,11 +33,11 @@ class Prober():
             logger.info("loading BERT model from {}".format(model_name))
 
         # Load pre-trained model tokenizer (vocabulary)
-        random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed(args.seed)
-        if torch.cuda.device_count() > 1:
-            torch.cuda.manual_seed_all(args.seed)
+        # random.seed(args.seed)
+        # torch.manual_seed(args.seed)
+        # torch.cuda.manual_seed(args.seed)
+        # if torch.cuda.device_count() > 1:
+        #     torch.cuda.manual_seed_all(args.seed)
 
         config = AutoConfig.from_pretrained(model_name)
         if isinstance(config, AlbertConfig):
