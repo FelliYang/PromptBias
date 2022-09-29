@@ -1,4 +1,5 @@
 import argparse
+import sys
 from ast import arg, parse
 from asyncore import write
 from distutils.debug import DEBUG
@@ -65,6 +66,8 @@ class Experiment():
         self.warmup_proportion = 0.1
         self.sub_reduce = False
         self.obj_resample = True
+        self.augment_train_data = False
+        self.noise_std = 0.1
         
 
         # init the random model which share the backbone weights between differnet random model
@@ -82,8 +85,6 @@ class Experiment():
 
 
     def experiment_for_one_relation(self, relation:str, write_to_file=False):
-        
-
         collect=[]
         ckpt_1,(best_epoch_1,valid_loss_1)  = self.train_model([relation], random_init="all")
         precision_1,test_loss_1 = self.evaluate_model([relation], random_init="all", prompt_ckpt_path=ckpt_1)
@@ -176,7 +177,7 @@ class Experiment():
                         f.write(","+str(round(precision,5)))
                     f.write("\n")
     
-
+    
     def experiment_raw_N_times(self,N):
         """
         run experiment without any data preprocess N times
@@ -222,7 +223,6 @@ class Experiment():
                         precision = collects[j][i][1]
                         f.write(","+str(round(precision,5)))
                     f.write("\n")
-
                 
     def experiment_reduce_majoriy_more(self):
         self.output_dir = "outputs/experiment/reduce_majorty_more"
@@ -245,7 +245,35 @@ class Experiment():
         for relation in tqdm(self.relations):
             self.experiment_for_one_relation(relation,write_to_file=True)
     
-    
+    def experiment_one_relation_N_times(self, relation, N, message="none"):
+        out = []
+        for i in tqdm(range(N)):
+            _ = self.experiment_for_one_relation(relation,write_to_file=False)
+            out.append(_)
+        
+        stdout_back = sys.stdout
+        sys.stdout =  open("log.txt","w")
+        print(message)
+        res1 = [[], [], []]
+        for item in out:
+            p1 = item[0][1]
+            p2 = item[1][1]
+            p3 = item[2][1]
+            res1[0].append(p1)
+            res1[1].append(p2)
+            res1[2].append(p3)
+            print(p1,p2,p3)
+        
+        mean = [0]*3
+        std = [0]*3
+        for i in range(3):
+            mean[i] = np.mean(res1[i])
+            std[i] = np.std(res1[i])
+        print(mean)
+        print(std)
+
+        sys.stdout = stdout_back
+
     def generate_init_model(self, random_init):
         model = Prober(args,random_init)
         torch.save(model.mlm_model.state_dict(), os.path.join(self.output_dir,f"random_{random_init}.ckpt"))
@@ -284,7 +312,6 @@ class Experiment():
         train_data = PromptDataset(train_data)
         valid_data = PromptDataset(valid_data)
 
-        
         
         assert len(relation) == 1 # we only support one relation to train now
         def collate_fn(list_items):
@@ -332,7 +359,7 @@ class Experiment():
 
                 sentences_b = [s["input_sentences"] for s in samples_b]
 
-                loss = model.run_batch(sentences_b, samples_b, training=True)
+                loss = model.run_batch(sentences_b, samples_b, training=True, augment_training_data=self.augment_train_data, noise_std=self.noise_std)
                 loss.backward()
 
                 # set normal tokens' gradients to be zero
@@ -474,9 +501,10 @@ class Experiment():
 # vocab_subset = load_vocab(common_vocab_path)
 # load_data_one_to_one("/home/jiao/code/prompt/OptiPrompt/data/autoprompt_data/P1376/train.jsonl",template, vocab_subset)
 
-def experiment_data_reduce_with(relation,run_full_data=False):  
+def experiment_data_reduce_with(relation,run_full_data=False, augement_data=False,sub_reduce=False):  
 
     exp = Experiment()
+    exp.augment_train_data = augement_data
     # exp.experiment_reduce_majority()
     random_times = 10
     if run_full_data:
@@ -488,49 +516,82 @@ def experiment_data_reduce_with(relation,run_full_data=False):
             out1.append(_)
 
     out2 = []
-    exp.sub_reduce = True
-    for i in tqdm(range(random_times)):
-        set_seed(args.seed+i)
-        _ = exp.experiment_for_one_relation(relation,write_to_file=False)
-        out2.append(_)
+    if sub_reduce:
+        exp.sub_reduce = True
+        for i in tqdm(range(random_times)):
+            set_seed(args.seed+i)
+            _ = exp.experiment_for_one_relation(relation,write_to_file=False)
+            out2.append(_)
+
     if run_full_data:
-        res1 = [0,0,0]
+        res1 = [[]] * 3
         print("*****for reduce majority*******")
         for item in out1:
             p1 = item[0][1]
             p2 = item[1][1]
             p3 = item[2][1]
-            res1[0]+=p1
-            res1[1]+=p2
-            res1[2]+=p3
+            res1[0].append(p1)
+            res1[1].append(p2)
+            res1[2].append(p3)
             print(p1,p2,p3)
 
 
-
-    res2 = [0,0,0]
-    print("***** for reduce more *********")
-    for item in out2:
-        p1 = item[0][1]
-        p2 = item[1][1]
-        p3 = item[2][1]
-        res2[0]+=p1
-        res2[1]+=p2
-        res2[2]+=p3
-        print(p1,p2,p3)
+    if sub_reduce:
+        res2 = [[]] * 3
+        print("***** for reduce more *********")
+        for item in out2:
+            p1 = item[0][1]
+            p2 = item[1][1]
+            p3 = item[2][1]
+            res2[0].append(p1)
+            res2[1].append(p2)
+            res2[2].append(p3)
+            print(p1,p2,p3)
 
     print("*******for average ******")
     if run_full_data:
-        res1 = [i/random_times for i in res1]
-        print(res1)
+        mean = [0]*3
+        std = [0]*3
+        for i in range(3):
+            mean[i] = np.mean(res1[i])
+            std[i] = np.std(res1[i])
+        print(mean)
+        print(std)
+    if sub_reduce:
+        mean = [0]*3
+        std = [0]*3
+        for i in range(3):
+            mean[i] = np.mean(res2[i])
+            std[i] = np.std(res2[i])
+        print(mean)
+        print(std)
 
-    res2 = [i/random_times for i in res2]
-    print(res2)
-
-
+    
 # experiment_data_reduce_with("P140",run_full_data=True)
 # exp = Experiment()
 
-exp = Experiment()
-exp.show_data_distribution()
-# exp.experiment_reduce_majority_N_times(10)
+# exp = Experiment()
+# # exp.show_data_distribution()
+# # exp.experiment_reduce_majority_N_times(10)
+# exp.augment_train_data = True
+
+# collect=[]
+# relation = "P30"
+# for i in tqdm(range(5)):
+#     ckpt_1,(best_epoch_1,valid_loss_1)  = exp.train_model([relation], random_init="all")
+#     precision_1,test_loss_1 = exp.evaluate_model([relation], random_init="all", prompt_ckpt_path=ckpt_1)
+#     collect.append([relation, precision_1, best_epoch_1, valid_loss_1, test_loss_1])
+
+# precisions = []
+# for i in range(5):
+#     print(collect[i])
+#     precisions.append(collect[i][1])
+# print("mean {} std {}".format(np.mean(np.array(precisions)),np.std(np.array(precisions)) ) )
 # exp.experiment_raw_N_times(10)
+
+# experiment_data_reduce_with("P30",run_full_data=)
+exp = Experiment()
+exp.obj_resample = True
+exp.augment_train_data = True
+exp.noise_std = 0.1
+exp.experiment_one_relation_N_times("P1303",5)

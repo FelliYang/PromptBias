@@ -142,16 +142,19 @@ class Prober():
         tokenized_text_list = []
         mlm_labels_tensor_list = []
         mlm_label_ids = []
+        # do not apply pad for sub_label_tokens since it is not neccesiry
+        sub_label_tokens_list = []
 
         max_tokens = 0
         for (sentences, samples) in zip(sentences_list, samples_list):
-            tokens_tensor, segments_tensor, masked_indices, tokenized_text, mlm_labels_tensor, mlm_label_id = self.__get_input_tensors(sentences, mlm_label=samples['obj_label'])
+            tokens_tensor, segments_tensor, masked_indices, tokenized_text, mlm_labels_tensor, mlm_label_id, sub_label_tokens = self.__get_input_tensors(sentences, mlm_label=samples['obj_label'])
             tokens_tensors_list.append(tokens_tensor)
             segments_tensors_list.append(segments_tensor)
             masked_indices_list.append(masked_indices)
             tokenized_text_list.append(tokenized_text)
             mlm_labels_tensor_list.append(mlm_labels_tensor)
             mlm_label_ids.append(mlm_label_id)
+            sub_label_tokens_list.append(sub_label_tokens)
             if (tokens_tensor.shape[1] > max_tokens):
                 max_tokens = tokens_tensor.shape[1]
 
@@ -185,16 +188,17 @@ class Prober():
                 final_attention_mask = torch.cat((final_attention_mask,attention_tensor), dim=0)
                 final_mlm_labels_tensor = torch.cat((final_mlm_labels_tensor,mlm_labels_tensor), dim=0)
 
-        return final_tokens_tensor, final_segments_tensor, final_attention_mask, masked_indices_list, tokenized_text_list, final_mlm_labels_tensor, mlm_label_ids
+        return final_tokens_tensor, final_segments_tensor, final_attention_mask, masked_indices_list, tokenized_text_list, final_mlm_labels_tensor, mlm_label_ids, sub_label_tokens_list
 
     def __get_input_tensors_batch(self, sentences_list):
         tokens_tensors_list = []
         segments_tensors_list = []
         masked_indices_list = []
         tokenized_text_list = []
+        sub_label_tokens_list = []
         max_tokens = 0
         for sentences in sentences_list:
-            tokens_tensor, segments_tensor, masked_indices, tokenized_text = self.__get_input_tensors(sentences)
+            tokens_tensor, segments_tensor, masked_indices, tokenized_text, sub_label_tokens = self.__get_input_tensors(sentences)
             tokens_tensors_list.append(tokens_tensor)
             segments_tensors_list.append(segments_tensor)
             masked_indices_list.append(masked_indices)
@@ -271,6 +275,13 @@ class Prober():
         tokenized_text.insert(0,self.CLS)
         segments_ids.insert(0,0)
 
+        # code for data augmentation
+        # sub_label_tokens is used to identity which token is belong to original sub_label field
+        assert len(sentences)==1
+        filter_list = ["[CLS]", "[SEP]", "[MASK]", "."]
+        sub_label_tokens = [ 0 if (token in filter_list) or token.startswith("[V") else 1 for token in tokenized_text]
+
+
         # look for masked indices
         masked_indices = []
         for i in range(len(tokenized_text)):
@@ -285,7 +296,7 @@ class Prober():
         segments_tensors = torch.tensor([segments_ids])
 
         if mlm_label is None:
-            return tokens_tensor, segments_tensors, masked_indices, tokenized_text
+            return tokens_tensor, segments_tensors, masked_indices, tokenized_text, sub_label_tokens
 
         # Handle mlm_label
         mlm_labels = np.full(len(tokenized_text), -100, dtype=int).tolist()
@@ -294,7 +305,7 @@ class Prober():
         mlm_labels[masked_indices[-1]] = tmp_ids[0]
         mlm_labels_tensor = torch.tensor([mlm_labels])
 
-        return tokens_tensor, segments_tensors, masked_indices, tokenized_text, mlm_labels_tensor, tmp_ids[0]
+        return tokens_tensor, segments_tensors, masked_indices, tokenized_text, mlm_labels_tensor, tmp_ids[0], sub_label_tokens
 
     def __get_token_ids_from_tensor(self, indexed_string):
         token_ids = []
@@ -333,21 +344,43 @@ class Prober():
 
         return log_probs, token_ids_list, masked_indices_list
 
-    def run_batch(self, sentences_list, samples_list, try_cuda=True, training=True, filter_indices=None, index_list=None, vocab_to_common_vocab=None, filtered_example_num=None):
+    def run_batch(self, sentences_list, samples_list, try_cuda=True, training=True, filter_indices=None, index_list=None, vocab_to_common_vocab=None, filtered_example_num=None, augment_training_data=False, noise_std=0.0):
         if try_cuda and torch.cuda.device_count() > 0:
             self.try_cuda()
 
-        tokens_tensor, segments_tensor, attention_mask_tensor, masked_indices_list, tokenized_text_list, mlm_labels_tensor, mlm_label_ids = self._get_input_tensors_batch_train(sentences_list, samples_list)
+        tokens_tensor, segments_tensor, attention_mask_tensor, masked_indices_list, tokenized_text_list, mlm_labels_tensor, mlm_label_ids, sub_label_tokens_list = self._get_input_tensors_batch_train(sentences_list, samples_list)
 
         if training:
             self.mlm_model.train()
-            loss = self.mlm_model(
-                input_ids=tokens_tensor.to(self._model_device),
-                token_type_ids=segments_tensor.to(self._model_device),
-                attention_mask=attention_mask_tensor.to(self._model_device),
-                masked_lm_labels=mlm_labels_tensor.to(self._model_device),
-            )
-            loss = loss[0]
+            tokens_tensor = tokens_tensor.to(self._model_device)
+            segments_tensor = segments_tensor.to(self._model_device)
+            attention_mask_tensor = attention_mask_tensor.to(self._model_device)
+            mlm_labels_tensor = mlm_labels_tensor.to(self._model_device)
+            if not augment_training_data:
+                loss = self.mlm_model(input_ids=tokens_tensor, token_type_ids= segments_tensor, attention_mask=attention_mask_tensor,masked_lm_labels=mlm_labels_tensor,)
+                loss = loss[0]
+            else:
+                # first get embedding
+                embedding = self.mlm_model.bert.embeddings.word_embeddings(tokens_tensor)
+                # second modify the embedding vectors
+                for i in range(len(sub_label_tokens_list)):
+                    sub_label_tokens = sub_label_tokens_list[i]
+                    start = sub_label_tokens.index(1)
+                    end = sub_label_tokens.index(0,1)
+                    length = end-start
+
+                    # temp = embedding[i][start:end].clone()
+                    # 生成随机噪音
+                    noise = torch.normal(0,noise_std,size=(length, embedding.shape[-1])).to(embedding.device)
+                    embedding[i][start:end] += noise
+                    # temp2 = temp == embedding[i][start:end] - noise
+                    # print(temp2)
+                    # pass
+                # third pass this embedding into the transfermer
+                loss = self.mlm_model(token_type_ids= segments_tensor, attention_mask=attention_mask_tensor,masked_lm_labels=mlm_labels_tensor, inputs_embeds=embedding)
+                loss = loss[0]
+                
+                
         else:
             self.mlm_model.eval()
             with torch.no_grad():
