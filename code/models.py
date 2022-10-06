@@ -108,18 +108,21 @@ class Prober():
     def init_indices_for_filter_logprobs(self, vocab_subset, logger=None):
         index_list = []
         new_vocab_subset = []
+        exception = 0
         for word in vocab_subset:
-            tokens = self.tokenizer.tokenize(' '+word)
-            if (len(tokens) == 1) and (tokens[0] != self.UNK):
-                index_list.append(self.tokenizer.convert_tokens_to_ids(tokens)[0])
+            # tokens = self.tokenizer.tokenize(' '+word)
+            # if (len(tokens) == 1) and (tokens[0] != self.UNK):
+            try:
+                index_list.append(self.tokenizer.convert_tokens_to_ids(word))
                 new_vocab_subset.append(word)
-            else:
-                msg = "word {} from vocab_subset not in model vocabulary!".format(word)
-                if logger is not None:
-                    logger.warning(msg)
-                else:
-                    logger.info("WARNING: {}".format(msg))
-
+            except:
+                exception += 1
+                # msg = "word {} from vocab_subset not in model vocabulary!".format(word)
+                # if logger is not None:
+                #     logger.warning(msg)
+                # else:
+                #     logger.info("WARNING: {}".format(msg))
+        print(f"common vocabs has {exception} vocabs not in original vocab")
         indices = torch.as_tensor(index_list)
         return indices, index_list
 

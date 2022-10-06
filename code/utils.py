@@ -29,6 +29,14 @@ def load_file(filename):
             data.append(json.loads(line))
     return data
 
+def load_json(filename):
+    try:
+        with open(filename,"r") as f:
+            data =  json.load(f)
+        return data
+    except:
+        print(f"error: cannot open the {filename}")
+        exit(-1)
 def parse_template(template, subject_label, object_label='[MASK]'):
     SUBJ_SYMBOL = "[X]"
     OBJ_SYMBOL = "[Y]"
@@ -160,7 +168,7 @@ def evaluate(model:Prober, samples_batches, sentences_batches, filter_indices=No
         eval_loss += loss.item() * tot_b
     
     if filter_indices is not None  and filtered_examples_num>0:
-        logger.info(f"filtered {filtered_examples_num} example(s) in test cause common vocab")
+        logger.warn(f"filtered {filtered_examples_num} example(s) in test cause common vocab")
 
     if output_topk is not None:
         logger.info('Output top-k prediction to %s..'%output_topk)
@@ -169,11 +177,12 @@ def evaluate(model:Prober, samples_batches, sentences_batches, filter_indices=No
                 f.write('\n'.join([json.dumps(x) for x in list_of_predictions[rel]]))
     # result中包含 {relation :（corrent_prediction, total_prediction, c/t, relation_tot_loss）, xxx}
     precion,eval_loss_avg = output_result_simple(result, eval_loss)
-    return precion, eval_loss_avg
+    return precion, eval_loss_avg, list_of_predictions
 
 def gen_feature_sample(data_sample, template, mask_token='[MASK]'):
     feature_sample = {}
-    feature_sample['predicate_id'] = data_sample['predicate_id']
+    if data_sample.__contains__("predicate_id"):
+        feature_sample['predicate_id'] = data_sample['predicate_id']
     feature_sample['sub_label'] = data_sample['sub_label']
     feature_sample['obj_label'] = data_sample['obj_label']
     feature_sample['uuid'] = data_sample['uuid'] if 'uuid' in data_sample else ''
@@ -251,18 +260,36 @@ def load_data(data_path:list, template, vocab_subset=None, mask_token='[MASK]', 
      which helps reduce the obj_label inbalance
     save_data_info is used to save some info like the data distribution in dataset
     """
-    assert len(data_path) == 1
+    if isinstance(data_path,list):
+        assert len(data_path)==1
+        data_path = data_path[0]
+    else:
+        file_path = data_path
+
+    if os.path.splitext(file_path)[-1] == ".jsonl":
+        raw_samples = load_file(file_path)
+    else:
+        # 对于wiki-uni格式，需要手动加入predicate_id
+        raw_samples = load_json(file_path)
+        if not raw_samples[0].__contains__("predicate_id"):
+            relation = os.path.basename(file_path)
+            for item in raw_samples:
+                item.update({"predicate_id":relation})
     all_samples = []
     weights = []
 
     distinct_facts = set()
-    raw_samples = load_file(data_path[0])
+    
     filtered = 0
     for data_sample in raw_samples:
         # follow the LAMA setting, only keep distinct (sub, obj) pairs
-        if (data_sample['sub_label'], data_sample['obj_label']) in distinct_facts:
-            continue
-        if (data_sample['obj_label'] not in vocab_subset):
+        # FIXME:由于uni里存在数据重复，暂时关闭这个重复过滤功能
+        # if (data_sample['sub_label'], data_sample['obj_label']) in distinct_facts:
+        #     print(data_sample)
+        #     filtered += 1
+        #     continue
+        if vocab_subset and data_sample['obj_label'] not in vocab_subset:
+            # print(data_sample)
             filtered += 1
             continue
         # assert data_sample['obj_label'] in vocab_subset
@@ -387,15 +414,3 @@ def load_optiprompt(args, ckpt_path="none"):
     with torch.no_grad():
         model.base_model.embeddings.word_embeddings.weight[original_vocab_size:] = torch.Tensor(vs)
     return model
-
-class PromptDataset(Dataset):
-    def __init__(self, data):
-        super().__init__()
-        self.data = data
-        self.length = len(self.data)
-    def __getitem__(self, index):
-        return self.data[index]
-    def __len__(self):
-        return self.length
-
-
