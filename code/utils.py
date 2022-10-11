@@ -253,7 +253,7 @@ def init_template(args, model):
 
 
 
-def load_data(data_path:list, template, vocab_subset=None, mask_token='[MASK]', weight_sample = False, sub_reduce=False, save_data_info="none"):
+def load_data(data_path, template, vocab_subset=None, mask_token='[MASK]', weight_sample = False, sub_reduce=False, save_data_info="none"):
     """
     load data only support load one relation one time
     get the filtered data examples and the optional corrensponding sample weight use in train data,
@@ -262,7 +262,7 @@ def load_data(data_path:list, template, vocab_subset=None, mask_token='[MASK]', 
     """
     if isinstance(data_path,list):
         assert len(data_path)==1
-        data_path = data_path[0]
+        file_path = data_path[0]
     else:
         file_path = data_path
 
@@ -272,7 +272,7 @@ def load_data(data_path:list, template, vocab_subset=None, mask_token='[MASK]', 
         # 对于wiki-uni格式，需要手动加入predicate_id
         raw_samples = load_json(file_path)
         if not raw_samples[0].__contains__("predicate_id"):
-            relation = os.path.basename(file_path)
+            relation = os.path.basename(os.path.dirname(file_path))
             for item in raw_samples:
                 item.update({"predicate_id":relation})
     all_samples = []
