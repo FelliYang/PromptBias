@@ -22,12 +22,16 @@ def load_vocab(vocab_filename):
     vocab = [x.strip() for x in lines]
     return vocab
 
-def load_file(filename):
-    data = []
-    with open(filename, "r") as f:
-        for line in f.readlines():
-            data.append(json.loads(line))
-    return data
+def load_jsonl(filename):
+    try:
+        data = []
+        with open(filename, "r") as f:
+            for line in f.readlines():
+                data.append(json.loads(line))
+        return data
+    except:
+        print(f"error: cannot open the {filename}")
+        exit(-1)
 
 def load_json(filename):
     try:

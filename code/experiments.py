@@ -86,7 +86,7 @@ class Experiment():
         #         self.generate_init_model("embedding", os.path.join(dir_path,f"random_embedding_{i}.ckpt"))
 
         # collect relations from jsonl
-        data =  load_file("/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LAMA_relations.jsonl")
+        data =  load_jsonl("/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LAMA_relations.jsonl")
         relations = [ d["relation"] for d in data]
         for r in relations:
             if os.path.exists(os.path.join(self.data_dir, r, "train.jsonl")):
@@ -870,7 +870,7 @@ class Experiment():
         """
         model = Prober(args, random_init=random_init)
         # reinit
-        if random_init is not "none":
+        if random_init != "none":
             try:
                  model.mlm_model.load_state_dict(torch.load(
                         os.path.join(self.output_dir,"random_weight", f"random_{random_init}_{random_weight_index}.ckpt")))
@@ -988,7 +988,7 @@ class Experiment():
         # create model
         model = Prober(args, random_init=random_init)
         # reinit to the weight same as train
-        if random_init is not "none":
+        if random_init != "none":
             try:
                  model.mlm_model.load_state_dict(torch.load(
                         os.path.join(self.output_dir, "random_weight",f"random_{random_init}_{random_weight_index}.ckpt")))
