@@ -298,11 +298,7 @@ class Experiment():
         """
         model_bert = model.bert
         model_cls  = model.cls
-        #TODO 加入两种模式的判断
-        try:
-            raw_bias = model.cls.predictions.decoder.bias.data.clone()
-        except:
-            raw_bias = None
+        
         model_input = tokenizer(template,return_tensors="pt")
         model_input = {key:value.to(model.device) for key,value in model_input.items()}
 
@@ -321,15 +317,8 @@ class Experiment():
         # 这个transform层的意义我不清楚，但是很重要，这才算是得到了特征向量
         bias_features = model.cls.predictions.transform(bias_bert)
         # 两种不同模式下的处理
-        if raw_bias!=None:
-            norm2 = torch.norm(bias_features)
-            model.cls.predictions.decoder.bias.data = raw_bias / norm2
-            bias_features_renormal = F.normalize(bias_features,p=2,dim=-1)
-            bias_logits = model_cls.predictions.decoder(bias_features_renormal)
-            model.cls.predictions.decoder.bias.data  = raw_bias
-        else:
-            bias_features_renormal = F.normalize(bias_features,p=2,dim=-1)
-            bias_logits = model_cls.predictions.decoder(bias_features_renormal)
+        norm2 = torch.norm(bias_features)
+        bias_logits = model_cls.predictions.decoder(bias_features) / norm2
 
         return bias_logits    
 
@@ -412,14 +401,6 @@ class Experiment():
         model_bert = model.bert
         model_cls = model.cls
         
-        
-        try:
-            raw_bias = model.cls.predictions.decoder.bias.data.clone()
-        except:
-            # 没有bias向量，说明模型embedding空间已经正则化了
-            raw_bias = None
-            
-
 
         if embeddings_renormalize:
             # 修改模型embeddings
@@ -494,11 +475,6 @@ class Experiment():
             tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
             batch_size=16,shuffle=False)
         
-
-
-        # 该操作确保model没有被上面的代码修改
-        if raw_bias !=None:
-            model.cls.predictions.decoder.bias.data = raw_bias
 
         # 准备prompt Model
         promptModel = PromptModel(
@@ -747,7 +723,8 @@ class Experiment():
      #TODO 在手工模板搞定后,重构random的代码,
     def random_prompt(self, relation, random_init="none"):
         # 获取预训练模型
-        plm, tokenizer, model_config, WrapperClass = load_plm("bert", "bert-base-cased")
+        plm, tokenizer, model_config, WrapperClass = self.plm,self.tokenizer,self.model_config,self.WrapperClass
+        
         if random_init=="all":
             plm = AutoModelForMaskedLM.from_config(model_config)
 
@@ -890,21 +867,15 @@ class Experiment():
                     output_bert = promptModel.plm.bert(**input_batch)[0]
                     mask_token_bert = output_bert[torch.where(inputs['loss_ids']>0)]
                     mask_token_features = promptModel.plm.cls.predictions.transform(mask_token_bert)
-                    mask_token_features_renormal = F.normalize(mask_token_features,p=2,dim=-1)
                     mask_token_logits = None
-                    for i in range(mask_token_features_renormal.shape[0]):
-                        if raw_bias != None:
-                            norm2 = torch.norm(mask_token_features[i], p=2)
-                            promptModel.plm.cls.predictions.decoder.bias.data = raw_bias / norm2
-                        temp = promptModel.plm.cls.predictions.decoder(mask_token_features_renormal[i]).unsqueeze(dim=0)
+                    for i in range(mask_token_features.shape[0]):
+                        norm2 = torch.norm(mask_token_features[i], p=2)
+                        temp = promptModel.plm.cls.predictions.decoder(mask_token_features[i]).unsqueeze(dim=0) / norm2
                         if mask_token_logits == None:
                             mask_token_logits = temp
                         else:
                             mask_token_logits = torch.cat((mask_token_logits,temp),dim=0)
                     
-                    # 复原 避免副作用
-                    if raw_bias != None:
-                        promptModel.plm.cls.predictions.decoder.bias.data = raw_bias
                     mask_logits = mask_token_logits
                 else:
                     logits = promptModel(inputs).logits
@@ -1710,8 +1681,8 @@ exp = Experiment()
 
 # exp.relations = ["P19","P20"]
 
-exp.experiment_renormal_vector_debais(ctrl_code=[1,0,0],vocab_subset="common_vocab", embeddings_renormalize=False, prompt="LPAQA")
-exp.experiment_renormal_vector_debais(ctrl_code=[1,0,0],vocab_subset="common_vocab", embeddings_renormalize=False, prompt="AutoPrompt")
+exp.experiment_renormal_vector_debais(ctrl_code=[1,0,0], embeddings_renormalize=False)
+# exp.experiment_renormal_vector_debais(ctrl_code=[1,0,0],vocab_subset="common_vocab", embeddings_renormalize=False, prompt="AutoPrompt")
 # exp.experiment_renormal_vector_debais(ctrl_code=[1,1,1], embeddings_renormalize=True, prompt="LPAQA")
 # exp.experiment_renormal_vector_debais(ctrl_code=[1,1,1], embeddings_renormalize=True, prompt="AutoPrompt")
 # exp.experiment_renormal_vector_debais(ctrl_code=[1,1,1],embeddings_renormalize=True)
