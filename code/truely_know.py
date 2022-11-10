@@ -33,6 +33,7 @@ from matplotlib import pyplot as plt
 from collections import Counter,defaultdict
 from math import log
 from utils import set_seed
+from prettytable import PrettyTable
 
 set_seed(7)
 
@@ -45,6 +46,9 @@ class Experiment():
         self.learning_rate = 3e-3
         self.warmup_proportion = 0.1
         self.prefix_token_num = 5
+
+        # output save
+        self.output_result = {}
         
         # dataset
         self.lama_data_dir = "/home/jiao/code/prompt/OptiPrompt/data/LAMA-TREx"
@@ -84,12 +88,56 @@ class Experiment():
         self.lama_vocab_subset = load_vocab(self.common_vocab_path)
         self.common_vocab_indices =  self.get_common_vocab_indices(self.lama_vocab_subset,self.tokenizer)
 
+
+    def clear_output(self,):
+        self.output_result = {}
+    
+    def save_output(self, path):
+        self.create_dir(path)
+        str = json.dumps(self.output_result,indent=4)
+        with open(path, "w") as f:
+            f.write(str)
+
+    def load_output(self, path):
+        with open(path, "r") as f:
+            d = json.load(f)
+            self.output_result = d
+    
+    def print_output(self,):
+        for model in self.output_result.keys():
+            table = PrettyTable()
+            table.title = model
+            table.field_names = ["Datasets",  "Prompts","P","P^d","KL","KL^d"]
+            model_output = self.output_result[model]
+            for dataset in model_output.keys():
+                table.add_row([dataset,"","","","",""])
+                dataset_output = model_output[dataset]
+                for prompt in dataset_output.keys():
+                    prompt_output = dataset_output[prompt]
+                    P,P_d,KL,KL_d = prompt_output['P'], prompt_output["P_d"], prompt_output["KL"], prompt_output["KL_d"]
+                    P = round(P,2)
+                    P_d = round(P_d,2)
+                    KL = round(KL,2)
+                    KL_d = round(KL_d,2)
+                    table.add_row(["",prompt,P,P_d,KL,KL_d])
+            print(table)
+                    
+
+    def add_output_item(self,model, dataset, prompt, result):
+        if model not in self.output_result.keys():
+            self.output_result[model] = {}
+        if dataset not in self.output_result[model].keys():
+            self.output_result[model][dataset] = {}
+        self.output_result[model][dataset][prompt] = {"P":result[0], "P_d":result[1], "KL":result[2], "KL_d":result[3]}
+
+
     def create_dir(self, path):
         """为任意路径创建其父目录"""
         dir_name = os.path.dirname(path)
         if not os.path.exists(dir_name):
             os.makedirs(dir_name)
     
+
     def load_data(self, data_path, vocab_subset=None, filter_repeat=True, return_resample_weights=False, ):
         # 从文件中load出list格式的数据集
         ext = os.path.splitext(data_path)[-1]
@@ -107,13 +155,7 @@ class Experiment():
             print(f"打开文件{data_path}失败")
             exit(-1)
 
-        # 如果data中不包括predicate_id信息，则手动加入
-        relation = os.path.basename(os.path.dirname(data_path))
-        if not data[0].__contains__("predicate_id"):
-            relation = os.path.basename(os.path.dirname(data_path))
-            for item in data:
-                item.update({"predicate_id":relation})
-        
+        # 如果data中不包括add_output_item
         # 如果vocab_subset存在，那么需要根据vocab_subset来过滤不符合要求的obj_label
         if vocab_subset:
             current_len = len(data)
@@ -297,6 +339,7 @@ class Experiment():
             bias = torch.from_numpy(bias)
         return bias
     
+    
     def get_template_bias_tensor(self, model,tokenizer, template):
         """
         返回某个template在model下的bais_logits，该logits已经归一化了
@@ -465,6 +508,7 @@ class Experiment():
         bias_logits = self.get_template_bias_tensor(model,tokenizer,template=prompt_only_tempalte)
         
 
+
         # # 默认路径
         # if bias_tensor is None:
         #     bias_Y_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_data.csv".format(
@@ -556,7 +600,14 @@ class Experiment():
         KL_save_f.write("Relation")
 
         total_diff = [[],[],[]]
-        
+        # 保存所有精度和所有KL散度
+        output_save = { 
+                        "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[]},
+                        "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[]},
+                        "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
+                      }
+
+
         for i in range(dataset_num):
             save_path = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/{save_dir}/{dataset_names[i]}_difference_debias.csv"
             self.create_dir(save_path)
@@ -626,7 +677,11 @@ class Experiment():
                     vocab_subset=vocab_subset,
                     test_data_path=data_paths[i],
                     prompt=manual_prompt)
-
+                
+                dataset = list(output_save.keys())[i]
+                output_save[dataset]["P"].append(acc_origin)
+                output_save[dataset]["P_d"].append(acc_debias)
+                
 
                 # 计算出来分布，用于绘图
                 num_data = len(preds_before)
@@ -643,6 +698,10 @@ class Experiment():
                 
                 KL_before = round(self.kl_divergence(bias_dis, preds_before_dis),5)
                 KL_after = round(self.kl_divergence(bias_dis, preds_after_dis),5)
+
+                output_save[dataset]["KL"].append(KL_before)
+                output_save[dataset]["KL_d"].append(KL_after)
+
                 if i==first_dataset_index:
                     KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
                 else:
@@ -654,7 +713,6 @@ class Experiment():
                 # preds和labels均是原始词汇表里面的，绘图前需要转换成subset_vocab的索引
                 preds_before = [subvocab_indices_list.index(i) for i in preds_before]
                 preds_after = [subvocab_indices_list.index(i) for i in preds_after]
-                
 
                 labels = [subvocab_indices_list.index(i) for i in labels]
 
@@ -691,10 +749,25 @@ class Experiment():
         
         KL_save_f.close()
 
+        # 处理输出
+        for i,dataset in enumerate(output_save.keys()):
+            if ctrl_code[i]==0:
+                continue
+            avg_p = np.mean(output_save[dataset]["P"])
+            avg_p_d = np.mean(output_save[dataset]["P_d"])
+            avg_KL = np.mean(output_save[dataset]["KL"])
+            avg_KL_d = np.mean(output_save[dataset]["KL_d"])
+            self.add_output_item("bert-base-cased", dataset,prompt=manual_prompt,result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+        
+        self.print_output()
+                
+
+
         if embeddings_renormalize==True:
             output_embedding_backup = output_embedding_backup.to(self.plm.device)
             self.plm.set_output_embeddings(output_embedding_backup)
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
+
 
     def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="prefix"):
         #TODO 实现一下
@@ -825,6 +898,7 @@ class Experiment():
         
         KL_save_f.close()
 
+
     def wrap_input_examples(self, raw_dataset:list, tokenizer:PreTrainedTokenizer):
         wrapped = []
         for data in raw_dataset:
@@ -832,6 +906,7 @@ class Experiment():
             wrapped.append(input_example)
 
         return wrapped
+
 
     def compute_max_pad(self, dataset, WrapperClass, tokenizer, OpenPromptTemplate:Template):
         max_tokens_len = 0
@@ -854,7 +929,7 @@ class Experiment():
         
         return max_tokens_len
 
-     #TODO 在手工模板搞定后,重构random的代码,
+
     def random_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none", ):
         # 获取预训练模型
         plm, tokenizer, model_config, WrapperClass = self.plm,self.tokenizer,self.model_config,self.WrapperClass
@@ -1016,7 +1091,8 @@ class Experiment():
         # print("use time {}".format(time()-time_start))
 
         return model_bias_output,debias_output,origin_output
-        
+
+
     def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader, soft_tempalte_ckpt=None, bias_logits=None, vocab_subset_indices=None):
         promptModel.eval()
         
@@ -1090,6 +1166,7 @@ class Experiment():
         print(acc)
         # 对于vocab_subset的场景，allpreds和alllabels均是原始词表中的索引
         return acc, (probs, allpreds, alllabels)
+
 
     def raw_manual_prompt(self, relation):
         tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
@@ -1848,12 +1925,21 @@ class Experiment():
 
 
 exp = Experiment()
+# exp.output_result = {"Bert":{"LAMA":{"manual":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}, "lpaqa":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}},
+#                              "UNI":{"manual":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}, "lpaqa":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}} } }
+# exp.print_output()
+exp.relations=["P19","P20"]
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+exp.save_output("output/temp.json")
 # exp.random_prompt("P19",debias=False)
 # _,(acc,_),_ = exp.random_prompt("P19",debias=True,vocab_subset_filter="answer_type_tokens")
 
-
-
-# exp.experiment_answer_subset_bias()
+# exp.relations = ["P19"]
+# exp.manual_prompt("P19",vocab_subset="answer_type_tokens",
+# # test_data_path="/home/jiao/code/prompt/OptiPrompt/data/wiki_uni/P19.json"
+# )
+# exp.experiment_renormal_vector_debias_for_continue_prompt(ctrl_code=[1,0,0])
+# exp.experiment_answer_subset_bias()       
 # exp.experiment_renormal_raw_manual_prompt("P19")
 # exp.run_manual_prompt_all_relation(vocab_subset="answer_type_tokens",embeddings_renormalize=True)
 # exp.run_manual_prompt_all_relation(vocab_subset="answer_type_tokens",embeddings_renormalize=False)
@@ -1865,7 +1951,7 @@ exp = Experiment()
 # exp.manual_prompt("P19",vocab_subset="answer_type_tokens",debias=True)
 
 # exp.relations = ["P19","P20"]
-exp.experiment_renormal_vector_debias_for_continue_prompt(ctrl_code=[1,0,0])
+# exp.experiment_renormal_vector_debias_for_continue_prompt(ctrl_code=[1,0,0])
 # exp.experiment_renormal_vector_debais_for_manual_prompt(ctrl_code=[1,1,1], embeddings_renormalize=False)
 # exp.experiment_renormal_vector_debais(ctrl_code=[1,0,0],vocab_subset="common_vocab", embeddings_renormalize=False, prompt="AutoPrompt")
 # exp.experiment_renormal_vector_debais(ctrl_code=[1,1,1], embeddings_renormalize=True, prompt="LPAQA")
