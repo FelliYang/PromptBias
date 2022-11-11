@@ -79,6 +79,7 @@ class Experiment():
         # TODO 使用的模型完全由配置决定, 修改其他文件中重复导入的配置（在后续支持其他模型的时候做吧）
         # 获取预训练模型
         plm, tokenizer, model_config, WrapperClass = load_plm("bert", "bert-base-cased")
+        self.model_name = "bert-base-cased"
         self.plm = plm
         self.tokenizer = tokenizer
         self.model_config = model_config
@@ -86,8 +87,16 @@ class Experiment():
 
         # 导入LAMA的公共词表
         self.lama_vocab_subset = load_vocab(self.common_vocab_path)
-        self.common_vocab_indices =  self.get_common_vocab_indices(self.lama_vocab_subset,self.tokenizer)
+        # self.common_vocab_indices =  self.get_common_vocab_indices(self.lama_vocab_subset,self.tokenizer)
 
+
+    def change_model(self,model_type, model_name):
+        self.model_name = model_name
+        plm, tokenizer, model_config, WrapperClass = load_plm(model_type, model_name)
+        self.plm = plm
+        self.tokenizer = tokenizer
+        self.model_config = model_config
+        self.WrapperClass = WrapperClass
 
     def clear_output(self,):
         self.output_result = {}
@@ -115,8 +124,8 @@ class Experiment():
                 for prompt in dataset_output.keys():
                     prompt_output = dataset_output[prompt]
                     P,P_d,KL,KL_d = prompt_output['P'], prompt_output["P_d"], prompt_output["KL"], prompt_output["KL_d"]
-                    P = round(P,2)
-                    P_d = round(P_d,2)
+                    P = round(P*100,2)
+                    P_d = round(P_d*100,2)
                     KL = round(KL,2)
                     KL_d = round(KL_d,2)
                     table.add_row(["",prompt,P,P_d,KL,KL_d])
@@ -757,7 +766,7 @@ class Experiment():
             avg_p_d = np.mean(output_save[dataset]["P_d"])
             avg_KL = np.mean(output_save[dataset]["KL"])
             avg_KL_d = np.mean(output_save[dataset]["KL_d"])
-            self.add_output_item("bert-base-cased", dataset,prompt=manual_prompt,result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+            self.add_output_item(self.model_name, dataset,prompt=manual_prompt,result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
         
         self.print_output()
                 
@@ -825,7 +834,7 @@ class Experiment():
                 (model_bias,debias_res,origin_res) = self.random_prompt(relation,vocab_subset_filter=vocab_subset_filter,vocab_subset=vocab_subset,)
                 subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
                                                         if vocab_subset == "answer_type_tokens" else \
-                                            self.common_vocab_indices
+                                            self.get_common_vocab_indices(self.lama_vocab_subset,self.tokenizer)
                 subvocab_indices_list = subvocab_tokens_indices.tolist()
                 subvocab_tokens_indices = subvocab_tokens_indices.to(model_bias.device)
                 bias_tensor = model_bias.index_select(index=subvocab_tokens_indices,dim=0).cpu().detach()
@@ -993,7 +1002,7 @@ class Experiment():
     
         if vocab_subset_filter:
             if vocab_subset=="common_vocab":
-                subset_indices = self.common_vocab_indices
+                subset_indices = self.get_common_vocab_indices(self.lama_vocab_subset,self.tokenizer)
             elif vocab_subset=="answer_type_tokens":
                 subset_indices = self.get_answer_entity_indices(relation, tokenizer)
             else:
@@ -1928,9 +1937,36 @@ exp = Experiment()
 # exp.output_result = {"Bert":{"LAMA":{"manual":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}, "lpaqa":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}},
 #                              "UNI":{"manual":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}, "lpaqa":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}} } }
 # exp.print_output()
-exp.relations=["P19","P20"]
+output_dir = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/result_statistic"
+
+# exp.load_output(output_dir+"/bert-large-cased/manual/result.json")
+# exp.print_output()
+# exit(-1)
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+
+exp.change_model("bert","bert-large-cased")
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exp.save_output("output/temp.json")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.save_output(output_dir+"/bert-large-cased/manual/result.json")
+exp.clear_output()
+
+exp.change_model("bert","bert-base-cased")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.save_output(output_dir+"/bert-base-cased/manual/result.json")
+exp.clear_output()
+
+exp.change_model("roberta","roberta-large")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.save_output(output_dir+"/roberta-large/manual/result.json")
+exp.clear_output()
+
+
+
 # exp.random_prompt("P19",debias=False)
 # _,(acc,_),_ = exp.random_prompt("P19",debias=True,vocab_subset_filter="answer_type_tokens")
 
