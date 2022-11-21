@@ -45,7 +45,7 @@ class Experiment():
         self.num_epochs = 10
         self.learning_rate = 3e-3
         self.warmup_proportion = 0.1
-        self.prefix_token_num = 5
+        num_tokens = 5
 
         # output save
         self.output_result = {}
@@ -303,8 +303,8 @@ class Experiment():
 
     def generate_model_bias(self, model, tokenizer:AutoTokenizer, prompt_only, save_path=None, vocab_subset_indices =None, return_logits=False,):
         """
-        该函数目的是针对某个prompt作用下的model，得到一个bias的分布表
-        prompt_only形式为 [MASK] was born in [MASK] . 这种形式
+        该函数目的是针对某个manual prompt作用下的model，得到一个bias的分布
+        prompt_only形式为 "[MASK] was born in [MASK] ." 这种形式
         映入vocab_subset_indices 来对齐lama在logits上的过滤
         """
         model_input = tokenizer(prompt_only,return_tensors="pt")
@@ -358,7 +358,7 @@ class Experiment():
     
     def get_template_bias_tensor(self, model,tokenizer, template):
         """
-        返回某个template在model下的bais_logits，该logits已经归一化了
+        返回某个manual template在model下的bais_logits，该logits已经归一化了, 将会用于debias
         template 的形式为 [MASK] xxx xxx xxx [MASK]
         """
         # 统一框架
@@ -391,7 +391,6 @@ class Experiment():
 
         # 这个transform层的意义我不清楚，但是很重要，这才算是得到了特征向量
         bias_features = tranform_layer(transformer_output)
-        # 两种不同模式下的处理
         norm2 = torch.norm(bias_features)
         bias_logits = decoder(bias_features) / norm2
 
@@ -801,14 +800,26 @@ class Experiment():
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
 
 
-    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="prefix"):
+    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5):
         #TODO 实现一下
         """
         ctrl_code 代表需要测试的数据集， 包扩[lama, wiki-uni, lama_whu]
         """
+        if embeddings_renormalize==True:
+             # 修改模型embeddings
+            config = self.model_config
+            renormal = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            renormal.weight.data = self.plm.cls.predictions.decoder.weight.data.clone()
+            renormal.weight.data = F.normalize(renormal.weight.data, p=2,dim=1)
+            # renormal.bias = model.cls.predictions.decoder.bias
+            output_embedding_backup = self.plm.get_output_embeddings()
+            self.plm.set_output_embeddings(renormal)
+            self.plm.bert.embeddings.word_embeddings.weight = renormal.weight
+
+
         root_dir = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/continue_prompt"
         
-        save_dir = continue_prompt+f"_{self.prefix_token_num}" + f"/debias_{vocab_subset}/"
+        save_dir = continue_prompt+f"_{num_tokens}" + f"/debias_{vocab_subset}/"
         if embeddings_renormalize==True:
             save_dir += "renormalize_embedding"
         else:
@@ -825,6 +836,12 @@ class Experiment():
         KL_save_f.write("Relation")
 
         total_diff = [[],[],[]]
+        # 保存所有精度和所有KL散度
+        output_save = { 
+                        "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[]},
+                        "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[]},
+                        "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
+                      }
 
         
         for i in range(dataset_num):
@@ -846,42 +863,49 @@ class Experiment():
         first_dataset_index = ctrl_code.index(1)
 
         for relation in self.relations:
-            lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-            uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
-            lama_whu_data_path = os.path.join(self.lama_whu_data_dir,f"{relation}.jsonl")
-            data_paths = [lama_data_path,uni_data_path,lama_whu_data_path]
-            for i in range(len(data_paths)):
-                if ctrl_code[i]==0:
-                    continue
+            
+            model_bias, results = self.continue_prompt(relation,vocab_subset_filter=vocab_subset_filter,
+                                                                    vocab_subset=vocab_subset,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            
+            subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
+                                                    if vocab_subset == "answer_type_tokens" else \
+                                        self.get_common_vocab_indices(self.tokenizer)
+            subvocab_indices_list = subvocab_tokens_indices.tolist()
+            subvocab_tokens_indices = subvocab_tokens_indices.to(model_bias.device)
+            bias_tensor = model_bias.index_select(index=subvocab_tokens_indices,dim=0).cpu().detach()
+            bias_probs = torch.softmax(bias_tensor,dim=-1).tolist()
+            # 用于计算KL散度
+            bias_dis = defaultdict(int, zip(subvocab_indices_list,bias_probs))
+            # 计算出来分布，用于绘图
+
+            for i in range(len(dataset_names)):
                 f = files[i]
-                (model_bias,debias_res,origin_res) = self.random_prompt(relation,vocab_subset_filter=vocab_subset_filter,vocab_subset=vocab_subset,)
-                subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
-                                                        if vocab_subset == "answer_type_tokens" else \
-                                            self.get_common_vocab_indices(self.tokenizer)
-                subvocab_indices_list = subvocab_tokens_indices.tolist()
-                subvocab_tokens_indices = subvocab_tokens_indices.to(model_bias.device)
-                bias_tensor = model_bias.index_select(index=subvocab_tokens_indices,dim=0).cpu().detach()
-                bias_probs = torch.softmax(bias_tensor,dim=-1).tolist()
-                # 用于计算KL散度
-                bias_dis = defaultdict(int, zip(subvocab_indices_list,bias_probs))
-                # 计算出来分布，用于绘图
+                debias_res,origin_res = results[dataset_names[i]]
                 acc_origin,(_, preds_before, labels) = origin_res
                 acc_debias,(_, preds_after, _) = debias_res
+                dataset = list(output_save.keys())[i]
+                output_save[dataset]["P"].append(acc_origin)
+                output_save[dataset]["P_d"].append(acc_debias)
+
 
                 num_data = len(preds_before)
                 preds_before_count =  Counter(preds_before)
                 preds_before_dis = defaultdict(int,
-                                                 {key: preds_before_count[key]/num_data
-                                                 for key in preds_before_count.keys()}
-                                                 )
+                                                    {key: preds_before_count[key]/num_data
+                                                    for key in preds_before_count.keys()}
+                                                    )
                 preds_after_count = Counter(preds_after)
                 preds_after_dis = defaultdict(int,
-                                                 {key: preds_after_count[key]/num_data 
+                                                    {key: preds_after_count[key]/num_data 
                                                     for key in preds_after_count.keys()}
-                                                 )
+                                                    )
                 
                 KL_before = round(self.kl_divergence(bias_dis, preds_before_dis),5)
                 KL_after = round(self.kl_divergence(bias_dis, preds_after_dis),5)
+                
+                output_save[dataset]["KL"].append(KL_before)
+                output_save[dataset]["KL_d"].append(KL_after)
+
                 if i==first_dataset_index:
                     KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
                 else:
@@ -930,6 +954,23 @@ class Experiment():
         
         KL_save_f.close()
 
+         # 处理输出
+        for i,dataset in enumerate(output_save.keys()):
+            if ctrl_code[i]==0:
+                continue
+            avg_p = np.mean(output_save[dataset]["P"])
+            avg_p_d = np.mean(output_save[dataset]["P_d"])
+            avg_KL = np.mean(output_save[dataset]["KL"])
+            avg_KL_d = np.mean(output_save[dataset]["KL_d"])
+            self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+        
+        self.print_output()
+
+        if embeddings_renormalize==True:
+            output_embedding_backup = output_embedding_backup.to(self.plm.device)
+            self.plm.set_output_embeddings(output_embedding_backup)
+            self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
+
 
     def wrap_input_examples(self, raw_dataset:list, tokenizer:PreTrainedTokenizer, autoprompt_postfix=""):
         # autoprompt_postfix: 针对autoprompt, 部分模板是在[x]后面加了一些字符。对于其他手工模板没有意义
@@ -965,50 +1006,71 @@ class Experiment():
         return max_tokens_len
 
 
-    def random_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none", ):
+    def continue_prompt(self, relation, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none"):
+        """
+        对单个relation，训练出一个连续模板
+        输出(model_bias, original_output, debiased_output)
+        可以选择的连续模板包括： prefix prompt
+        """
+
         # 获取预训练模型
         plm, tokenizer, model_config, WrapperClass = self.plm,self.tokenizer,self.model_config,self.WrapperClass
+        model = plm
 
+        # 是否要对模型的weight随机初始化
         if random_init=="all":
             plm = AutoModelForMaskedLM.from_config(model_config)
 
         # 构造数据集        
         dataset = {}
         lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
+        uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
+        lama_whu_data_path = os.path.join(self.lama_whu_data_dir,f"{relation}.jsonl")
+        data_paths = [lama_data_path,uni_data_path,lama_whu_data_path]
+
         autoprompt_train_data_path = os.path.join(self.auto_prompt_dir,relation,"train.jsonl")
         autoprompt_valid_data_path = os.path.join(self.auto_prompt_dir,relation, "dev.jsonl")
 
-        raw_test_data, _ = self.load_data(lama_data_path, vocab_subset=self.lama_vocab_subset,)
         raw_train_data, resample_weight = self.load_data(autoprompt_train_data_path,return_resample_weights=True)
         raw_valid_data, _ = self.load_data(autoprompt_valid_data_path)
+        raw_test_data = []
 
-        dataset["test"] = self.wrap_input_examples(raw_test_data, tokenizer)
+        for data_path in data_paths:
+            data,_ = self.load_data(data_path, vocab_subset=self.lama_vocab_subset,)
+            raw_test_data.append(data)
+
         dataset["train"] = self.wrap_input_examples(raw_train_data, tokenizer)
         dataset["valid"] = self.wrap_input_examples(raw_valid_data, tokenizer)
+
+        dataset["test"] = {}
+        dataset["test"]["lama"] =  self.wrap_input_examples(raw_test_data[0], tokenizer)
+        dataset["test"]["uni"] = self.wrap_input_examples(raw_test_data[1], tokenizer)
+        dataset["test"]["lama_whu"] = self.wrap_input_examples(raw_test_data[2], tokenizer)
         
-        current_template = '{"placeholder":"text_a"} '
-        current_template += '{"soft"} ' * 5
-        current_template += '{"mask"} .'
-        template = "soft"
-        if template=="soft":
+        
+        if continue_prompt=="prefix":
+            current_template = '{"placeholder":"text_a"} '
+            current_template += '{"mask"} .'
+
             prompt_template = SoftTemplate(
-                model=plm, tokenizer=tokenizer, text=current_template,num_tokens=self.prefix_token_num)
-            
-            # 使用opti中参考的初始化方式，将embedding初始化成正态分布
+                model=plm, tokenizer=tokenizer, text=current_template,num_tokens=num_tokens)
+            # 使用optiprompt中参考的初始化方式，将embedding初始化成正态分布
             prompt_template.soft_embeds.data.normal_(mean=0.0, std=model_config.initializer_range)
-        elif template=="mixed":
+        elif continue_prompt=="optiprompt":
+            current_template = '{"placeholder":"text_a"} '
+            current_template += '{"soft":None,"duplicate":' + str(num_tokens) + '}'
+            current_template += '{"mask"} .'
             prompt_template = MixedTemplate(
                 model=plm, tokenizer=tokenizer, text=current_template)
             # FIXME 有点问题，之后再实现吧
-            prompt_template.soft_embedding.weight.normal_(mean=0.0, std=model_config.initializer_range)
+            prompt_template.soft_embedding.weight.data.normal_(mean=0.0, std=model_config.initializer_range)
 
         # 加载数据集
         # 计算lama需要的最大pad数量
         
-        # +20 是因为compute_max_pad不会考虑到soft token
-        max_tokens_len =  self.compute_max_pad(dataset,WrapperClass,tokenizer,prompt_template)+self.prefix_token_num
+        max_tokens_len = 64
         
-        # FIXME: 这里加了self.prefix_token_num，精度就没问题了，看起来应该是compute_max_pad里面有bug
+        # FIXME: 这里加了num_tokens，精度就没问题了，看起来应该是compute_max_pad里面有bug
         print(f"数据中最大token长度为{max_tokens_len}")
 
         sampler = WeightedRandomSampler(resample_weight, len(resample_weight))
@@ -1016,14 +1078,16 @@ class Experiment():
         #         tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len+5,
         #         batch_size=16,custom_sampler=sampler)
         train_dataloader = PromptDataLoader(dataset=dataset["train"], template=prompt_template, tokenizer=tokenizer,
-                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len+5,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                 batch_size=16)
         
         valid_dataloader = PromptDataLoader(dataset=dataset["valid"], template=prompt_template, tokenizer=tokenizer,
-                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len+5,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                 batch_size=16)
-        test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=tokenizer,
-                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len+5,
+        test_dataloader = {}
+        for dataset_name in ["lama","uni","lama_whu"]:
+           test_dataloader[dataset_name] = PromptDataLoader(dataset=dataset["test"][dataset_name], template=prompt_template, tokenizer=tokenizer,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                 batch_size=16)
     
         if vocab_subset_filter:
@@ -1084,51 +1148,72 @@ class Experiment():
                 # 保存最好的epoch
                 best_epoch = epoch
                 best_acc = acc
-                if template=="soft":
+                if continue_prompt=="prefix":
                     soft_embeds = promptModel.template.state_dict()["soft_embeds"].clone()
-                elif template=='mixed':
-                    soft_embeds = promptModel.template.state_dict()["soft_embedding"].clone()
+                elif continue_prompt=='optiprompt':
+                    soft_embeds = promptModel.template.state_dict()["soft_embedding.weight"].clone()
                 torch.save(soft_embeds,save_name)
                 
 
         print("best epoch {} valid precision: {}".format(best_epoch,best_acc,))
-    
         
-        # if debias:
-        # 加载best epoch模型，得到bias logits
-        soft_embeds = torch.load(save_name)
-        promptModel.template.soft_embeds.data.copy_(soft_embeds)
-        # TODO:如何使用promptModel来得到一个bias logits?
+        model_bias_output, bias_logits = self.get_continue_prompt_bias(promptModel,continue_prompt,num_tokens,save_name,prompt_template)
+
+        results  = {}
+        for dataset in ["lama","uni","lama_whu"]:
+            debias_output = self.evaluate(promptModel, test_dataloader[dataset], bias_logits=bias_logits,vocab_subset_indices=subset_indices,soft_tempalte_ckpt=save_name,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            origin_output = self.evaluate(promptModel, test_dataloader[dataset], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=save_name,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            results[dataset] = (debias_output,origin_output)
+
+        return model_bias_output, results
+
+
+    def get_continue_prompt_bias(self,promptModel, continue_prompt, num_tokens, ckpt_path, prompt_template):
+        # 加载best epoch模型，得到model bias logits和normalize后的bias_tensor
+         # 统一框架
+        # 1. transformer block
+        # 2. transform layer
+        # 3. decoder
+        model = promptModel.plm
+        if isinstance(model, BertForMaskedLM):
+            transformer_blocks = model.bert
+            tranform_layer  = model.cls.predictions.transform
+            decoder = model.cls.predictions.decoder
+        elif isinstance(model, RobertaForMaskedLM):
+            transformer_blocks = model.roberta
+            tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
+            decoder = model.lm_head.decoder
+        
+        soft_embeds = torch.load(ckpt_path)
+        if continue_prompt=="prefix":
+            promptModel.template.soft_embeds.data.copy_(soft_embeds)
+        elif continue_prompt=="optiprompt":
+            promptModel.template.soft_embedding.weight.data.copy_(soft_embeds)
+
         template_only = [{"sub_label":self.tokenizer.mask_token,"obj_label":"no"}]
-        temp_dataloader = PromptDataLoader(dataset=self.wrap_input_examples(template_only,tokenizer), template=prompt_template, tokenizer=tokenizer,
-            tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len+5,
-            batch_size=1)
+        temp_dataloader = PromptDataLoader(dataset=self.wrap_input_examples(template_only,self.tokenizer), template=prompt_template, tokenizer=self.tokenizer,
+            tokenizer_wrapper_class=self.WrapperClass, max_seq_length=256, batch_size=1)
         for inputs in temp_dataloader:
             inputs = inputs.cuda()
             batch = promptModel.template.process_batch(inputs)
             input_batch = {key: batch[key] for key in batch if key in promptModel.forward_keys}
-            transformer_output = promptModel.plm.bert(**input_batch)[0]
+
+            #FIXME: 不能只是用bert
+            transformer_output = transformer_blocks(**input_batch)[0]
             # 后处理
-            if template=="soft":
+            if continue_prompt=="prefix":
                 # 丢弃掉输出中的soft embedding
-                transformer_output = transformer_output[:,self.prefix_token_num:,:]
+                transformer_output = transformer_output[:,num_tokens:,:]
             mask_token_bert = transformer_output[torch.where(inputs['loss_ids']>0)]
-            mask_token_features = promptModel.plm.cls.predictions.transform(mask_token_bert)
+            mask_token_features = tranform_layer(mask_token_bert)
             norm2 = torch.norm(mask_token_features, p=2)
-            bias_logits = promptModel.plm.cls.predictions.decoder(mask_token_features[0]) / norm2
+            bias_logits = decoder(mask_token_features[0]) / norm2
         model_bias_output = bias_logits * norm2
-        debias_output = self.evaluate(promptModel, test_dataloader,bias_logits=bias_logits,vocab_subset_indices=subset_indices)
-        # else:
-            # self.evaluate(promptModel, save_name=save_name,test_dataloader,vocab_subset_indices=subset_indices)
-        origin_output = self.evaluate(promptModel, test_dataloader, save_name, vocab_subset_indices=subset_indices)
-        # print("best test precision: {}".format(acc,))
 
-        # print("use time {}".format(time()-time_start))
-
-        return model_bias_output,debias_output,origin_output
+        return model_bias_output, bias_logits
 
 
-    def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader, soft_tempalte_ckpt=None, bias_logits=None, vocab_subset_indices=None):
+    def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader,bias_logits=None, vocab_subset_indices=None,soft_tempalte_ckpt=None,continue_prompt="prefix",num_tokens=5):
         promptModel.eval()
 
         # 统一框架
@@ -1147,7 +1232,10 @@ class Experiment():
         
         if soft_tempalte_ckpt:
             soft_embeds = torch.load(soft_tempalte_ckpt)
-            promptModel.template.soft_embeds.data.copy_(soft_embeds)
+            if continue_prompt=="prefix":
+                promptModel.template.soft_embeds.data.copy_(soft_embeds)
+            elif continue_prompt=="optiprompt":
+                promptModel.template.soft_embedding.weight.data.copy_(soft_embeds)
 
         allpreds = []
         alllabels = []
@@ -1168,10 +1256,11 @@ class Experiment():
                     batch = promptModel.template.process_batch(inputs)
                     input_batch = {key: batch[key] for key in batch if key in promptModel.forward_keys}
                     transformer_output = transformer_blocks(**input_batch)[0]
+                    #FIXME 添加后处理
                     # 对于softtemplate，这里有一个后处理
                     if isinstance(promptModel.template,SoftTemplate):
                         # 去掉softembedding
-                        transformer_output = transformer_output[:,self.prefix_token_num:,:]
+                        transformer_output = transformer_output[:,num_tokens:,:]
                     mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
                     mask_token_features = tranform_layer(mask_token_transformer_output)
                     mask_token_logits = None
@@ -1975,105 +2064,37 @@ class Experiment():
 
 
 exp = Experiment()
-# exp.experiment_renormal_vector_debais_for_manual_prompt(vocab_subset="answer_type_tokens",ctrl_code=[1,1,1],manual_prompt="AutoPrompt")
-# exp.print_output()
-# exit(-1)
-# exp.output_result = {"Bert":{"LAMA":{"manual":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}, "lpaqa":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}},
-#                              "UNI":{"manual":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}, "lpaqa":{"P":1,"P_d":1.3,"KL":10,"KL_d":20}} } }
-# exp.print_output()
+exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
+# exp.continue_prompt("P19",continue_prompt="optiprompt")
 output_dir = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/result_statistic"
+exp.num_epochs = 10
+exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+exp.save_output(output_dir+"/bert/continue/bert_vocab_intersection_result.json")
 
-# exp.load_output(output_dir+"/bert-large-cased/manual/result.json")
-# exp.print_output()
-# exit(-1)
+# exp.num_epochs = 10
+# exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="prefix",num_tokens=5)
+# exp.save_output(output_dir+"/bert/continue/perfix_5/bert_vocab_intersection_result.json")
+# # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",embeddings_renormalize=True)
+
+
+# exp.init_model("roberta","roberta-large")
+# exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased_be_ro_al.txt")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
 # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-exp.init_model("roberta","roberta-large")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-# exp.save_output(output_dir+"/roberta-large/manual/result.json")
+# exp.save_output(output_dir+"/roberta-large/manual/roberta_vocab_intersection_result.json")
 # exp.clear_output()
 
-exp.init_model("bert","bert-base-cased")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+# exp.init_model("bert","bert-base-cased")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
 # exp.save_output(output_dir+"/bert-base-cased/manual/roberta_vocab_intersection_result.json")
 # exp.clear_output()
 
-exp.print_output()
-
-print("使用上一个版本的bert效果来对比")
-exp.clear_output()
-exp.load_output(output_dir+"/bert-base-cased/manual/roberta_vocab_intersection_result.json")
-exp.print_output()
-exit(-1)
-
-exp.init_model("bert","bert-large-cased")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-exp.save_output(output_dir+"/bert-large-cased/manual/roberta_vocab_intersection_result.json")
-exp.clear_output()
-
-
-
-
-
-
-
-# exp.random_prompt("P19",debias=False)
-# _,(acc,_),_ = exp.random_prompt("P19",debias=True,vocab_subset_filter="answer_type_tokens")
-
-# exp.relations = ["P19"]
-# exp.manual_prompt("P19",vocab_subset="answer_type_tokens",
-# # test_data_path="/home/jiao/code/prompt/OptiPrompt/data/wiki_uni/P19.json"
-# )
-# exp.experiment_renormal_vector_debias_for_continue_prompt(ctrl_code=[1,0,0])
-# exp.experiment_answer_subset_bias()       
-# exp.experiment_renormal_raw_manual_prompt("P19")
-# exp.run_manual_prompt_all_relation(vocab_subset="answer_type_tokens",embeddings_renormalize=True)
-# exp.run_manual_prompt_all_relation(vocab_subset="answer_type_tokens",embeddings_renormalize=False)
-# exp.run_manual_prompt_all_relation(vocab_subset="common_vocab", embeddings_renormalize=True)
-
-# exp.experiment_renormal_vector_difference_bias(relation='P19')
-# exp.experiment_renormal_vector_difference_bias_with_renormal_embedding(relation='P19')
-
-# exp.manual_prompt("P19",vocab_subset="answer_type_tokens",debias=True)
-
-# exp.relations = ["P19","P20"]experiment_renormal_vector_debais_for_manual_prompt,1,1],embeddings_renormalize=True)
-# exp.experiment_renormal_vector_debais(ctrl_code=[0,1,1])
-
-# exp.check_answer_entity_subset_of_common_vocab()
-# exp.generate_bias_datasets(round_num=5,sparse=True)
-# exp.manual_prompt("P19",debias=True)
-# exp.random_prompt("P19", random_init="all",)
-# exp.experiment_difference_bias(vocab_subset_filter=True)
-# exp.generate_bias_dataset(relation="P19",vocab_subset_filter=True, round_num=5, sparse=True)
-# exp.check_bias_dataset("/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/subvocab_filter/model_bias.jsonl",
-#         "/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/subvocab_filter/lama_data.jsonl")
-
-# exp.check_bias_dataset("/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/subvocab_filter/model_bias.jsonl",
-#         "/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/subvocab_filter/uni_data.jsonl")
-# exp.generate_bias_dataset(relation="P19",vocab_subset_filter=False, round_num=5, sparse=True)
-# exp.check_bias_dataset("/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/full/model_bias.jsonl",
-#         "/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/full/lama_data.jsonl")
-
-# exp.check_bias_dataset("/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/full/model_bias.jsonl",
-#         "/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/P19/full/uni_data.jsonl")
-
-
-# exp.manual_prompt("P19",debias=True)
-# acc = exp.manual_prompt("P19",vocab_subset_filter=True,debias=True)
-# print("精度为{}".format(round(acc*100,2)))
-# exp.experiment_difference_bias()
-# exp.experiment_difference_bias_new()
-# exp.get_answer_entity_indices(relation="P19")
-# acc = exp.manual_prompt("P19",vocab_subset_filter=True,vocab_subset="answer_type_tokens")
-# print("精度为{}".format(round(acc*100,2)))
-# exp.generate_bias_datasets(sparse=True,round_num=5)
-# b, _ = exp.load_data(os.path.join(exp.lama_data_dir,"P19.jsonl"))
-# tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-# model = AutoModelForMaskedLM.from_pretrained("bert-base-cased")
-# prompt_only = "[MASK] was born in [MASK] ."
-# exp.generate_model_bias(model,tacc = self.evaluate(promptModel,test_dataloader)
+# exp.init_model("bert","bert-large-cased")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+# exp.save_output(output_dir+"/bert-large-cased/manual/roberta_vocab_intersection_result.json")
+# exp.clear_output()
