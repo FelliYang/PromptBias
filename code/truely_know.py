@@ -34,6 +34,7 @@ from collections import Counter,defaultdict
 from math import log
 from utils import set_seed
 from prettytable import PrettyTable
+import copy
 
 set_seed(7)
 
@@ -613,6 +614,7 @@ class Experiment():
             self.plm.set_output_embeddings(renormal)
             self.plm.bert.embeddings.word_embeddings.weight = renormal.weight
             
+        root_dir = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/manual_prompt/{self.model_name}"
 
         save_dir = f"{manual_prompt}/debias_{vocab_subset}/"
         if embeddings_renormalize==True:
@@ -625,7 +627,7 @@ class Experiment():
         files = [None]*dataset_num
         img_save_dir = [None]*dataset_num
 
-        KL_save_path = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/{save_dir}/KL.csv"
+        KL_save_path = os.path.join(root_dir, f"{save_dir}/KL.csv")
         self.create_dir(KL_save_path)
         KL_save_f = open(KL_save_path,"w")
         KL_save_f.write("Relation")
@@ -640,9 +642,9 @@ class Experiment():
 
 
         for i in range(dataset_num):
-            save_path = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/{save_dir}/{dataset_names[i]}_difference_debias.csv"
+            save_path = os.path.join(root_dir, f"{save_dir}/{dataset_names[i]}_difference_debias.csv") 
             self.create_dir(save_path)
-            img_save_path = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/{save_dir}/img/{dataset_names[i]}"
+            img_save_path =  os.path.join(root_dir, f"{save_dir}/img/{dataset_names[i]}")
             img_save_dir[i] = img_save_path
             if ctrl_code[i]==1:
                 f = open(save_path,"w")
@@ -800,11 +802,15 @@ class Experiment():
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
 
 
-    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5):
-        #TODO 实现一下
+    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3):
         """
         ctrl_code 代表需要测试的数据集， 包扩[lama, wiki-uni, lama_whu]
+        continue_prompt 表示使用某个连续模板 支持prefix和optiprompt
+        repeated_times用于表示重复次数
         """
+
+        pbar = tqdm(total=len(self.relations)*repeat_times)
+        
         if embeddings_renormalize==True:
              # 修改模型embeddings
             config = self.model_config
@@ -816,161 +822,187 @@ class Experiment():
             self.plm.set_output_embeddings(renormal)
             self.plm.bert.embeddings.word_embeddings.weight = renormal.weight
 
+        # 保存self.output_result的当前值
+        self_output_result_bk = copy.copy(self.output_result)
 
-        root_dir = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/continue_prompt"
-        
-        save_dir = continue_prompt+f"_{num_tokens}" + f"/debias_{vocab_subset}/"
-        if embeddings_renormalize==True:
-            save_dir += "renormalize_embedding"
-        else:
-            save_dir += "origin_embedding"
-        
-        dataset_names = ["lama","uni","lama_whu"]
-        dataset_num = len(ctrl_code)
-        files = [None]*dataset_num
-        img_save_dir = [None]*dataset_num
-
-        KL_save_path = os.path.join(root_dir,f"{save_dir}/KL.csv")
-        self.create_dir(KL_save_path)
-        KL_save_f = open(KL_save_path,"w")
-        KL_save_f.write("Relation")
-
-        total_diff = [[],[],[]]
-        # 保存所有精度和所有KL散度
-        output_save = { 
-                        "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[]},
-                        "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[]},
-                        "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
-                      }
-
-        
-        for i in range(dataset_num):
-            save_path = os.path.join(root_dir, f"{save_dir}/{dataset_names[i]}_difference_debias.csv")
-            self.create_dir(save_path)
-            img_save_path = os.path.join(root_dir, f"{save_dir}/img/{dataset_names[i]}")
-            img_save_dir[i] = img_save_path
-            if ctrl_code[i]==1:
-                f = open(save_path,"w")
-                f.write("relation,diff,origin,debias\n")
-                files[i] = f
-
-                KL_save_f.write(f",{dataset_names[i]}_before,{dataset_names[i]}_after")
-
-
-
-        pbar = tqdm(total=len(self.relations)*sum(ctrl_code))
-
-        first_dataset_index = ctrl_code.index(1)
-
-        for relation in self.relations:
+        output_results = []
+        for index in range(1,repeat_times+1):
+            self.clear_output()
+            root_dir = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/continue_prompt/{self.model_name}"
             
-            model_bias, results = self.continue_prompt(relation,vocab_subset_filter=vocab_subset_filter,
-                                                                    vocab_subset=vocab_subset,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            save_dir = continue_prompt+f"_{num_tokens}" + f"/debias_{vocab_subset}/"
+            if embeddings_renormalize==True:
+                save_dir += "renormalize_embedding"
+            else:
+                save_dir += "origin_embedding"
             
-            subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
-                                                    if vocab_subset == "answer_type_tokens" else \
-                                        self.get_common_vocab_indices(self.tokenizer)
-            subvocab_indices_list = subvocab_tokens_indices.tolist()
-            subvocab_tokens_indices = subvocab_tokens_indices.to(model_bias.device)
-            bias_tensor = model_bias.index_select(index=subvocab_tokens_indices,dim=0).cpu().detach()
-            bias_probs = torch.softmax(bias_tensor,dim=-1).tolist()
-            # 用于计算KL散度
-            bias_dis = defaultdict(int, zip(subvocab_indices_list,bias_probs))
-            # 计算出来分布，用于绘图
+            save_dir += f"/exp_{index}"
+            
+            dataset_names = ["lama","uni","lama_whu"]
+            dataset_num = len(ctrl_code)
+            files = [None]*dataset_num
+            img_save_dir = [None]*dataset_num
 
-            for i in range(len(dataset_names)):
-                f = files[i]
-                debias_res,origin_res = results[dataset_names[i]]
-                acc_origin,(_, preds_before, labels) = origin_res
-                acc_debias,(_, preds_after, _) = debias_res
-                dataset = list(output_save.keys())[i]
-                output_save[dataset]["P"].append(acc_origin)
-                output_save[dataset]["P_d"].append(acc_debias)
+            KL_save_path = os.path.join(root_dir,f"{save_dir}/KL.csv")
+            self.create_dir(KL_save_path)
+            KL_save_f = open(KL_save_path,"w")
+            KL_save_f.write("Relation")
 
+            total_diff = [[],[],[]]
+            # 保存所有精度和所有KL散度
+            output_save = { 
+                            "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[]},
+                            "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[]},
+                            "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
+                        }
 
-                num_data = len(preds_before)
-                preds_before_count =  Counter(preds_before)
-                preds_before_dis = defaultdict(int,
-                                                    {key: preds_before_count[key]/num_data
-                                                    for key in preds_before_count.keys()}
-                                                    )
-                preds_after_count = Counter(preds_after)
-                preds_after_dis = defaultdict(int,
-                                                    {key: preds_after_count[key]/num_data 
-                                                    for key in preds_after_count.keys()}
-                                                    )
+            
+            for i in range(dataset_num):
+                save_path = os.path.join(root_dir, f"{save_dir}/{dataset_names[i]}_difference_debias.csv")
+                self.create_dir(save_path)
+                img_save_path = os.path.join(root_dir, f"{save_dir}/img/{dataset_names[i]}")
+                img_save_dir[i] = img_save_path
+                if ctrl_code[i]==1:
+                    f = open(save_path,"w")
+                    f.write("relation,diff,origin,debias\n")
+                    files[i] = f
+
+                    KL_save_f.write(f",{dataset_names[i]}_before,{dataset_names[i]}_after")
+
+            first_dataset_index = ctrl_code.index(1)
+
+            for relation in self.relations:
                 
-                KL_before = round(self.kl_divergence(bias_dis, preds_before_dis),5)
-                KL_after = round(self.kl_divergence(bias_dis, preds_after_dis),5)
+                model_bias, results = self.continue_prompt(relation, embedding_save_dir=os.path.join(root_dir,save_dir),vocab_subset_filter=vocab_subset_filter,
+                                                                        vocab_subset=vocab_subset,continue_prompt=continue_prompt,num_tokens=num_tokens)
                 
-                output_save[dataset]["KL"].append(KL_before)
-                output_save[dataset]["KL_d"].append(KL_after)
+                subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
+                                                        if vocab_subset == "answer_type_tokens" else \
+                                            self.get_common_vocab_indices(self.tokenizer)
+                subvocab_indices_list = subvocab_tokens_indices.tolist()
+                subvocab_tokens_indices = subvocab_tokens_indices.to(model_bias.device)
+                bias_tensor = model_bias.index_select(index=subvocab_tokens_indices,dim=0).cpu().detach()
+                bias_probs = torch.softmax(bias_tensor,dim=-1).tolist()
+                # 用于计算KL散度
+                bias_dis = defaultdict(int, zip(subvocab_indices_list,bias_probs))
+                # 计算出来分布，用于绘图
 
-                if i==first_dataset_index:
-                    KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
-                else:
-                    KL_save_f.write(f",{KL_before},{KL_after}")
-
-                # print(f"debais前KL散度为{KL_before} debias后KL散度为{KL_after}")
-
-
-                # preds和labels均是原始词汇表里面的，绘图前需要转换成subset_vocab的索引
-                preds_before = [subvocab_indices_list.index(i) for i in preds_before]
-                preds_after = [subvocab_indices_list.index(i) for i in preds_after]
-                
-
-                labels = [subvocab_indices_list.index(i) for i in labels]
-
-                img_save_path = os.path.join(img_save_dir[i], relation+".png")
-                self.create_dir(img_save_path)
-
-                self.generate_image(preds_before,preds_after,labels,model_bias=bias_tensor, save_path=img_save_path)
+                for i in range(len(dataset_names)):
+                    f = files[i]
+                    debias_res,origin_res = results[dataset_names[i]]
+                    acc_origin,(_, preds_before, labels) = origin_res
+                    acc_debias,(_, preds_after, _) = debias_res
+                    dataset = list(output_save.keys())[i]
+                    output_save[dataset]["P"].append(acc_origin)
+                    output_save[dataset]["P_d"].append(acc_debias)
 
 
-                diff = round(acc_debias - acc_origin,5)
-                
-                print("{} 原始精度{} debias精度{}".format(
-                    dataset_names[i],
-                    round(acc_origin*100,2),
-                    round(acc_debias*100,2)))
-                total_diff[i].append(diff)
-                f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
-                f.flush()
+                    num_data = len(preds_before)
+                    preds_before_count =  Counter(preds_before)
+                    preds_before_dis = defaultdict(int,
+                                                        {key: preds_before_count[key]/num_data
+                                                        for key in preds_before_count.keys()}
+                                                        )
+                    preds_after_count = Counter(preds_after)
+                    preds_after_dis = defaultdict(int,
+                                                        {key: preds_after_count[key]/num_data 
+                                                        for key in preds_after_count.keys()}
+                                                        )
+                    
+                    KL_before = round(self.kl_divergence(bias_dis, preds_before_dis),5)
+                    KL_after = round(self.kl_divergence(bias_dis, preds_after_dis),5)
+                    
+                    output_save[dataset]["KL"].append(KL_before)
+                    output_save[dataset]["KL_d"].append(KL_after)
+
+                    if i==first_dataset_index:
+                        KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
+                    else:
+                        KL_save_f.write(f",{KL_before},{KL_after}")
+
+                    # print(f"debais前KL散度为{KL_before} debias后KL散度为{KL_after}")
+
+
+                    # preds和labels均是原始词汇表里面的，绘图前需要转换成subset_vocab的索引
+                    preds_before = [subvocab_indices_list.index(i) for i in preds_before]
+                    preds_after = [subvocab_indices_list.index(i) for i in preds_after]
+                    
+
+                    labels = [subvocab_indices_list.index(i) for i in labels]
+
+                    img_save_path = os.path.join(img_save_dir[i], relation+".png")
+                    self.create_dir(img_save_path)
+
+                    self.generate_image(preds_before,preds_after,labels,model_bias=bias_tensor, save_path=img_save_path)
+
+
+                    diff = round(acc_debias - acc_origin,5)
+                    
+                    print("{} 原始精度{} debias精度{}".format(
+                        dataset_names[i],
+                        round(acc_origin*100,2),
+                        round(acc_debias*100,2)))
+                    total_diff[i].append(diff)
+                    f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
+                    f.flush()
+                    
+                    postfox = {
+                        "run nums": index,
+                        "lama_improve": 0 if ctrl_code[0]==0 or len(total_diff[0])==0 else round(sum(total_diff[0])/len(total_diff[0]), 3) * 100,
+                        "uni_improve": 0 if ctrl_code[1]==0 or len(total_diff[1])==0 else round(sum(total_diff[1])/len(total_diff[1]), 3) * 100,
+                        "lama_whu_improve": 0 if ctrl_code[2]==0 or len(total_diff[2])==0 else round(sum(total_diff[2])/len(total_diff[2]), 3) * 100,
+                        }
+
+                    pbar.set_postfix(postfox)
+
                 pbar.update(1)
-                
-                postfox = {
-                    "lama_improve": 0 if ctrl_code[0]==0 or len(total_diff[0])==0 else round(sum(total_diff[0])/len(total_diff[0]), 3) * 100,
-                    "uni_improve": 0 if ctrl_code[1]==0 or len(total_diff[1])==0 else round(sum(total_diff[1])/len(total_diff[1]), 3) * 100,
-                    "lama_whu_improve": 0 if ctrl_code[2]==0 or len(total_diff[2])==0 else round(sum(total_diff[2])/len(total_diff[2]), 3) * 100,
-                    }
+            for f in files:
+                if f != None:
+                    f.close()
+            
+            KL_save_f.close()
 
-                pbar.set_postfix(postfox)
-        
-        pbar.close()
-        
-        for f in files:
-            if f != None:
-                f.close()
-        
-        KL_save_f.close()
+            # 处理输出
+            for i,dataset in enumerate(output_save.keys()):
+                if ctrl_code[i]==0:
+                    continue
+                avg_p = np.mean(output_save[dataset]["P"])
+                avg_p_d = np.mean(output_save[dataset]["P_d"])
+                avg_KL = np.mean(output_save[dataset]["KL"])
+                avg_KL_d = np.mean(output_save[dataset]["KL_d"])
+                self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+            
+            self.save_output(os.path.join(root_dir, save_dir+"/result.json"))
+            temp = copy.copy(self.output_result)
+            output_results.append(temp)
 
-         # 处理输出
+
+
+        # 将多次实验的result融合起来
+        self.clear_output()
+        # 恢复之前的output
+        self.output_result = self_output_result_bk
+
         for i,dataset in enumerate(output_save.keys()):
             if ctrl_code[i]==0:
                 continue
-            avg_p = np.mean(output_save[dataset]["P"])
-            avg_p_d = np.mean(output_save[dataset]["P_d"])
-            avg_KL = np.mean(output_save[dataset]["KL"])
-            avg_KL_d = np.mean(output_save[dataset]["KL_d"])
+            P = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["P"] for result in output_results]
+            P_d = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["P_d"] for result in output_results]
+            KL = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["KL"] for result in output_results]
+            KL_d = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["KL_d"] for result in output_results]
+            avg_p = np.mean(P)
+            avg_p_d = np.mean(P_d)
+            avg_KL = np.mean(KL)
+            avg_KL_d = np.mean(KL_d)
             self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
-        
-        self.print_output()
+
 
         if embeddings_renormalize==True:
             output_embedding_backup = output_embedding_backup.to(self.plm.device)
             self.plm.set_output_embeddings(output_embedding_backup)
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
 
+        pbar.close()
 
     def wrap_input_examples(self, raw_dataset:list, tokenizer:PreTrainedTokenizer, autoprompt_postfix=""):
         # autoprompt_postfix: 针对autoprompt, 部分模板是在[x]后面加了一些字符。对于其他手工模板没有意义
@@ -1006,11 +1038,12 @@ class Experiment():
         return max_tokens_len
 
 
-    def continue_prompt(self, relation, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none"):
+    def continue_prompt(self, relation, embedding_save_dir, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none"):
         """
         对单个relation，训练出一个连续模板
         输出(model_bias, original_output, debiased_output)
         可以选择的连续模板包括： prefix prompt
+        embedding_save_dir代表保存训练好的continue prompt的路径
         """
 
         # 获取预训练模型
@@ -1124,7 +1157,7 @@ class Experiment():
         time_start = time()
         best_acc = 0
         best_epoch = -1
-        save_name = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/continue_prompt/weight_save/{relation}/model_full-prompt_random_init.ckpt"
+        save_name = os.path.join(embedding_save_dir, f"weight_save/{relation}/model_full-prompt_random_init.ckpt")  
         self.create_dir(save_name)
         for epoch in range(self.num_epochs):
             promptModel.train()
@@ -2064,37 +2097,45 @@ class Experiment():
 
 
 exp = Experiment()
-exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
 # exp.continue_prompt("P19",continue_prompt="optiprompt")
 output_dir = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/result_statistic"
-exp.num_epochs = 10
-exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-exp.save_output(output_dir+"/bert/continue/bert_vocab_intersection_result.json")
+# exp.num_epochs = 10
+# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+# exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+# exp.save_output(output_dir+"/bert/continue/bert_vocab_intersection_result.json")
 
 # exp.num_epochs = 10
 # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="prefix",num_tokens=5)
 # exp.save_output(output_dir+"/bert/continue/perfix_5/bert_vocab_intersection_result.json")
 # # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",embeddings_renormalize=True)
+exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+exit(-1)
 
 
-# exp.init_model("roberta","roberta-large")
-# exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased_be_ro_al.txt")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-# exp.save_output(output_dir+"/roberta-large/manual/roberta_vocab_intersection_result.json")
-# exp.clear_output()
+exp.init_model("bert","bert-base-cased")
+exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
+exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result.json")
+exp.clear_output()
 
-# exp.init_model("bert","bert-base-cased")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-# exp.save_output(output_dir+"/bert-base-cased/manual/roberta_vocab_intersection_result.json")
-# exp.clear_output()
+exp.init_model("bert","bert-large-cased")
+exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
+exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.save_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result.json")
+exp.clear_output()
 
-# exp.init_model("bert","bert-large-cased")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-# exp.save_output(output_dir+"/bert-large-cased/manual/roberta_vocab_intersection_result.json")
-# exp.clear_output()
+exp.init_model("roberta","roberta-large")
+exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased_be_ro_al.txt")
+exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.save_output(output_dir+"/roberta-large/roberta_vocab_intersection_result.json")
+exp.clear_output()
