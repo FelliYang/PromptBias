@@ -60,6 +60,7 @@ class Experiment():
         self.lama_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LAMA_relations.jsonl"
         self.LPAQA_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LPAQA_relations.jsonl"
         self.AutoPrompt_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/AutoPrompt_relations.jsonl"
+        self.AutoPrompt_roberta_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/AutoPrompt_relations_roberta.jsonl"
         # 导入LAMA manual prompt
         data = load_jsonl(self.lama_template_path)
         self.lama_template = dict([(item["relation"], item["template"]) for item in data])
@@ -67,6 +68,8 @@ class Experiment():
         self.LPAQA_template = dict([(item["relation"], item["template"]) for item in data])
         data = load_jsonl(self.AutoPrompt_template_path)
         self.AutoPrompt_template = dict([(item["relation"], item["template"]) for item in data])
+        data = load_jsonl(self.AutoPrompt_roberta_template_path)
+        self.AutoPrompt_tempalte_roberta = dict([(item["relation"], item["template"]) for item in data])
 
         # 导入LAMA所有关系
         data =  load_jsonl("/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LAMA_relations.jsonl")
@@ -514,7 +517,12 @@ class Experiment():
         elif prompt=="LPAQA":
             templates = self.LPAQA_template
         elif prompt=="AutoPrompt":
-            templates = self.AutoPrompt_template
+            if self.model_name.startswith("roberta"):
+                templates = self.AutoPrompt_tempalte_roberta
+            if self.model_name.startswith("bert"):
+                templates = self.AutoPrompt_template
+            else:
+                raise(f"prompt参数出错: {prompt}")
         else:
             raise(f"prompt参数出错: {prompt}")
 
@@ -523,14 +531,15 @@ class Experiment():
         # 在[x] 和下一个token之间的那部分被认为是autoprompt的post_fix
         # 例如P37 [X]inen dialects resembled officially exclusively [Y].
         first_token = raw_template.split()[0]
-        autoprompt_postfix = first_token[3:]
+        autoprompt_postfix = first_token[3:] if prompt=="AutoPrompt" else ''
 
         raw_test_data, _ = self.load_data(test_data_path, vocab_subset=self.lama_vocab_subset,)
         dataset["test"] = self.wrap_input_examples(raw_test_data, tokenizer,autoprompt_postfix=autoprompt_postfix)
 
 
         # 将模板转换成openprompt
-        template = raw_template.replace(first_token,'{"placeholder":"text_a"}')
+        template = raw_template.replace(first_token,'{"placeholder":"text_a"}') if prompt=="AutoPrompt" else \
+                    raw_template.replace("[X]", '{"placeholder":"text_a"}')
         template = template.replace("[Y]", '{"mask"}')
         prompt_template = ManualTemplate(tokenizer=tokenizer, text=template)
 
@@ -2108,34 +2117,29 @@ output_dir = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/result_statis
 # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="prefix",num_tokens=5)
 # exp.save_output(output_dir+"/bert/continue/perfix_5/bert_vocab_intersection_result.json")
 # # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",embeddings_renormalize=True)
-exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exit(-1)
-
-
 exp.init_model("bert","bert-base-cased")
 exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
-exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
 exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result.json")
 exp.clear_output()
 
 exp.init_model("bert","bert-large-cased")
 exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
-exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
 exp.save_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result.json")
 exp.clear_output()
 
 exp.init_model("roberta","roberta-large")
 exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased_be_ro_al.txt")
-exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
 exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
 exp.save_output(output_dir+"/roberta-large/roberta_vocab_intersection_result.json")
 exp.clear_output()
