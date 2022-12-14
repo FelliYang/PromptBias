@@ -7,7 +7,6 @@ import math
 import os
 from re import template
 from time import time
-from black import out
 
 import numpy as np
 import pandas as pd
@@ -23,7 +22,9 @@ from torch.utils.data import WeightedRandomSampler
 from tqdm import tqdm
 from transformers import (AdamW, AutoModelForMaskedLM, AutoTokenizer,
                           BertConfig, BertModel,AutoConfig,
-                          get_linear_schedule_with_warmup,BertForMaskedLM, RobertaForMaskedLM)
+                          get_linear_schedule_with_warmup,
+                          get_cosine_schedule_with_warmup,
+                          BertForMaskedLM, RobertaForMaskedLM)
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from utils import load_json, load_jsonl, load_vocab
@@ -51,16 +52,17 @@ class Experiment():
         # output save
         self.output_result = {}
         
+        self.work_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         # dataset
-        self.lama_data_dir = "/home/jiao/code/prompt/OptiPrompt/data/LAMA-TREx"
-        self.auto_prompt_dir = "/home/jiao/code/prompt/OptiPrompt/data/autoprompt_data"
-        self.lama_whu_data_dir = "/home/jiao/code/prompt/OptiPrompt/data/LAMA-TREx_UHN"
-        self.wiki_uni_data_dir = "/home/jiao/code/prompt/OptiPrompt/data/wiki_uni"
-        self.common_vocab_path = "/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased_be_ro_al.txt"
-        self.lama_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LAMA_relations.jsonl"
-        self.LPAQA_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LPAQA_relations.jsonl"
-        self.AutoPrompt_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/AutoPrompt_relations.jsonl"
-        self.AutoPrompt_roberta_template_path = "/home/jiao/code/prompt/OptiPrompt/relation_metainfo/AutoPrompt_relations_roberta.jsonl"
+        self.lama_data_dir = self.work_dir + "/data/LAMA-TREx"
+        self.auto_prompt_dir = self.work_dir + "/data/autoprompt_data"
+        self.lama_whu_data_dir = self.work_dir + "/data/LAMA-TREx_UHN"
+        self.wiki_uni_data_dir = self.work_dir + "/data/wiki_uni"
+        self.common_vocab_path = self.work_dir + "/common_vocabs/common_vocab_cased.txt"
+        self.lama_template_path = self.work_dir + "/relation_metainfo/LAMA_relations.jsonl"
+        self.LPAQA_template_path = self.work_dir + "/relation_metainfo/LPAQA_relations.jsonl"
+        self.AutoPrompt_template_path = self.work_dir + "/relation_metainfo/AutoPrompt_relations.jsonl"
+        self.AutoPrompt_roberta_template_path = self.work_dir + "/relation_metainfo/AutoPrompt_relations_roberta.jsonl"
         # 导入LAMA manual prompt
         data = load_jsonl(self.lama_template_path)
         self.lama_template = dict([(item["relation"], item["template"]) for item in data])
@@ -70,9 +72,10 @@ class Experiment():
         self.AutoPrompt_template = dict([(item["relation"], item["template"]) for item in data])
         data = load_jsonl(self.AutoPrompt_roberta_template_path)
         self.AutoPrompt_tempalte_roberta = dict([(item["relation"], item["template"]) for item in data])
+        self.AutoPrompt_tempalte_roberta = {k:v.strip() for k,v in self.AutoPrompt_tempalte_roberta.items()}
 
         # 导入LAMA所有关系
-        data =  load_jsonl("/home/jiao/code/prompt/OptiPrompt/relation_metainfo/LAMA_relations.jsonl")
+        data =  load_jsonl(self.work_dir + "/relation_metainfo/LAMA_relations.jsonl")
         self.relations = [ d["relation"] for d in data]
         # 过滤掉TRE之外的5个relation
         for relation in self.relations[:]:
@@ -80,7 +83,7 @@ class Experiment():
                 self.relations.remove(relation)
 
         # 获取预训练模型
-        self.init_model("bert","bert-base-cased")
+        # self.init_model("bert","bert-base-cased")
 
         # 导入LAMA的公共词表
         self.init_common_vocab(self.common_vocab_path)
@@ -241,7 +244,7 @@ class Experiment():
 
     def get_answer_entity_indices(self, relation,tokenizer:PreTrainedTokenizer, include_uni_labels=True, common_vocab_intersection=True):
         """这个函数用来得到lama对应的answer空间，例如P的answer空间是cities"""
-        entity_path = "/home/jiao/code/prompt/OptiPrompt/data/entity.json"
+        entity_path = self.work_dir + "/data/entity.json"
         entity_data = load_json(entity_path)[relation]
         entity_data = entity_data["objects"]
         # 需要对entity过滤，只留下单个词的entity
@@ -249,13 +252,6 @@ class Experiment():
         #  # 获取预训练模型
         # plm, tokenizer, model_config, WrapperClass = load_plm("bert", "bert-base-cased")
 
-        def filter_out_multi_token(entity):
-            out = tokenizer.tokenize(entity)
-            if len(out) == 1:
-                return True
-            else:
-                return False
-        
         common_vocab = self.lama_vocab_subset
         def filter_common_vocab_subset(word):
             if word in common_vocab:
@@ -344,21 +340,6 @@ class Experiment():
         
 
         return final_output
-
-
-    def load_Y_AVG(self, path, resample_weight=None):
-        if not os.path.exists(path):
-            print(f"文件不存在{path}")
-            exit(-1)
-        df = pd.read_csv(path)
-        if resample_weight==None:
-            bias = torch.from_numpy(df.mean().values)
-        else:
-            raw_data = df.values
-            bias = np.average(raw_data,axis=0,weights=resample_weight)
-            bias = torch.from_numpy(bias)
-        return bias
-    
     
     def get_template_bias_tensor(self, model,tokenizer, template):
         """
@@ -519,7 +500,7 @@ class Experiment():
         elif prompt=="AutoPrompt":
             if self.model_name.startswith("roberta"):
                 templates = self.AutoPrompt_tempalte_roberta
-            if self.model_name.startswith("bert"):
+            elif self.model_name.startswith("bert"):
                 templates = self.AutoPrompt_template
             else:
                 raise(f"prompt参数出错: {prompt}")
@@ -546,15 +527,7 @@ class Experiment():
         # 定义prompt_pnly_tempalte用于计算bias
         prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
         bias_logits = self.get_template_bias_tensor(model,tokenizer,template=prompt_only_tempalte)
-        
-
-
-        # # 默认路径
-        # if bias_tensor is None:
-        #     bias_Y_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_data.csv".format(
-        #         relation,"subvocab_filter" if vocab_subset_filter else "full")
-        #     bias_tensor = self.load_Y_AVG(bias_Y_path)
-
+    
 
 
         # 加载数据集
@@ -591,7 +564,7 @@ class Experiment():
 
 
     def run_manual_prompt_all_relation(self,vocab_subset="common_vocab", embeddings_renormalize=False):
-        save_path = f"/home/jiao/code/prompt/OptiPrompt/outputs/renormalize/lama_{vocab_subset}_renormalize.csv" if embeddings_renormalize else f"/home/jiao/code/prompt/OptiPrompt/outputs/renormalize/lama_{vocab_subset}.csv"
+        save_path = self.work_dir + f"/outputs/renormalize/lama_{vocab_subset}_renormalize.csv" if embeddings_renormalize else self.work_dir + f"/outputs/renormalize/lama_{vocab_subset}.csv"
         f = open(save_path,"w")
         f.write("relation,acc\n")
         pbar = tqdm(total=len(self.relations))
@@ -623,7 +596,7 @@ class Experiment():
             self.plm.set_output_embeddings(renormal)
             self.plm.bert.embeddings.word_embeddings.weight = renormal.weight
             
-        root_dir = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/manual_prompt/{self.model_name}"
+        root_dir = self.work_dir + f"/outputs/openprompt/manual_prompt/{self.model_name}"
 
         save_dir = f"{manual_prompt}/debias_{vocab_subset}/"
         if embeddings_renormalize==True:
@@ -837,7 +810,7 @@ class Experiment():
         output_results = []
         for index in range(1,repeat_times+1):
             self.clear_output()
-            root_dir = f"/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/continue_prompt/{self.model_name}"
+            root_dir = self.work_dir + f"/outputs/openprompt/continue_prompt/{self.model_name}"
             
             save_dir = continue_prompt+f"_{num_tokens}" + f"/debias_{vocab_subset}/"
             if embeddings_renormalize==True:
@@ -1013,6 +986,7 @@ class Experiment():
 
         pbar.close()
 
+
     def wrap_input_examples(self, raw_dataset:list, tokenizer:PreTrainedTokenizer, autoprompt_postfix=""):
         # autoprompt_postfix: 针对autoprompt, 部分模板是在[x]后面加了一些字符。对于其他手工模板没有意义
         wrapped = []
@@ -1161,7 +1135,7 @@ class Experiment():
 
         optimizer = AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
         t_total = len(dataset["train"]) * self.num_epochs
-        scheduler = get_linear_schedule_with_warmup(optimizer, int(t_total * self.warmup_proportion), t_total)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, int(t_total * self.warmup_proportion), t_total)
 
         time_start = time()
         best_acc = 0
@@ -1343,19 +1317,34 @@ class Experiment():
         
         acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
         
-        print(acc)
+        print(acc,flush=True)
         # 对于vocab_subset的场景，allpreds和alllabels均是原始词表中的索引
         return acc, (probs, allpreds, alllabels)
 
-
-    def raw_manual_prompt(self, relation):
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-        model = AutoModelForMaskedLM.from_pretrained("bert-base-cased")
-        raw_template = self.lama_template[relation]
+    """
+    LAMA最基础的实现，效率低，但是简单易懂
+    """
+    def raw_manual_prompt(self, relation, PLM="bert-base-cased", prompt="LAMA"):
+        tokenizer = AutoTokenizer.from_pretrained(PLM)
+        model = AutoModelForMaskedLM.from_pretrained(PLM)
+        if prompt=="LAMA":
+            raw_template = self.lama_template[relation]
+        elif prompt=="AutoPrompt":
+            if isinstance(model,RobertaForMaskedLM):
+                raw_template = self.AutoPrompt_tempalte_roberta[relation]
+            elif isinstance(model, BertForMaskedLM):
+                raw_template = self.AutoPrompt_template[relation]
+            else:
+                raise ValueError(f"参数值{PLM}不符合要求")
+        else:
+            raise ValueError(f"参数值{prompt}不符合要求")
         lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
         # lama_data_path = os.path.join(self.auto_prompt_dir,relation,"test.jsonl")
         lama_vocab_subset = load_vocab(self.common_vocab_path)
         raw_test_data, _ = self.load_data(lama_data_path, vocab_subset=lama_vocab_subset,)
+        # typed quering 候选词表
+        answer_indices = self.get_answer_entity_indices(relation,tokenizer)
+
 
         correct = 0
         total = 0
@@ -1377,8 +1366,10 @@ class Experiment():
             assert y_mask_index < 0
             
             mask_token = output[0][y_mask_index]
+            mask_token = mask_token[answer_indices]
             index = torch.argmax(mask_token).item()
-            if index == tokenizer.convert_tokens_to_ids(data["obj_label"]):
+            
+            if answer_indices[index] == tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' ' + data["obj_label"])[0]):
                 correct += 1
             total += 1
         
@@ -1400,746 +1391,74 @@ class Experiment():
         
         return KL
 
-    """废弃函数"""
-    def experiment_difference_bias(self,vocab_subset_filter=True):
-        save_path = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/debias/difference_debias.csv"
-        self.create_dir(save_path)
-        f = open(save_path, "w")
-        f.write("relation,diff,acc_origin,acc_debias\n")
-        pbar = tqdm(total=len(self.relations))
-        total_diff = []
-        for relation in self.relations:
-            acc_origin,_ = self.manual_prompt(relation,debias=False,vocab_subset_filter=vocab_subset_filter)
-            acc_debias,_ = self.manual_prompt(relation, debias=True,vocab_subset_filter=vocab_subset_filter)
-            print("原始精度{} debias精度{}".format(round(acc_origin*100,2),round(acc_debias*100,2)))
-            diff = round(acc_debias - acc_origin,5)
-
-            total_diff.append(diff)
-            f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
-            f.flush()
-            pbar.update(1)
-            pbar.set_postfix_str("avg improve {}".format(
-                round(sum(total_diff)/len(total_diff), 3)
-                ))
-        
-        pbar.close()
-
-        f.close()
-
-    """废弃函数，这个函数本来的目的是使用M(T(X))的probs做平均来debias但是没什么用"""
-    def experiment_difference_bias_new(self, vocab_subset_filter=True, ctrl_code=[1,1]):
-        """
-        ctrl_code 代表需要测试的数据集， 包扩[lama, wiki-uni]
-        """
-        lama_save_path = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/debias/lama_difference_debias.csv"
-        uni_save_path = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/debias/uni_difference_debias.csv"
-        save_paths = [lama_save_path,uni_save_path]
-
-
-        pbar = tqdm(total=len(self.relations)*sum(ctrl_code))
-        total_diff = [[],[]]
-        
-        for relation in self.relations:
-            lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-            uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
-            data_paths = [lama_data_path,uni_data_path]
-            # 构建两个bias tensor
-            uni_bias_Y_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_data.csv".format(
-                relation,"subvocab_filter" if vocab_subset_filter else "full")
-            uni_bias_tensor = self.load_Y_AVG(uni_bias_Y_path)
-           
-            lama_bias_Y_path = "model_bias_data/bert/manual_prompt/{}/{}/lama_data.csv".format(
-                relation,"subvocab_filter" if vocab_subset_filter else "full")
-            lama_bias_tensor = self.load_Y_AVG(lama_bias_Y_path)
-            bias_Y_paths = [lama_bias_Y_path, uni_bias_Y_path]
-
-            bias_tensors = [lama_bias_tensor, uni_bias_tensor]
-            # 根据label加上resample
-            lama_label_path = "model_bias_data/bert/manual_prompt/{}/{}/lama_label.csv".format(
-                relation,"subvocab_filter" if vocab_subset_filter else "full")
-            uni_label_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_label.csv".format(
-                relation,"subvocab_filter" if vocab_subset_filter else "full")
-            lama_label = pd.read_csv(lama_label_path)["label"].values
-            uni_label = pd.read_csv(uni_label_path)["label"].values
-            labels = [lama_label, uni_label]
-            for i,label in enumerate(labels):
-                label_count = collections.Counter(label)
-                type_num = len(label_count.keys())
-                label_num = len(label)
-                resample_weight = [ 1/label_count[type] for type in label]
-                # resample_weight = torch.tensor(resample_weight)
-                bias_tensors[i] = self.load_Y_AVG(bias_Y_paths[i], resample_weight=resample_weight)
-
-            for i in range(len(data_paths)):
-                if ctrl_code[i]==0:
-                    continue
-
-                f = open(save_paths[i], "w")
-                acc_origin,_ = self.manual_prompt(
-                    relation, debias=False, 
-                    vocab_subset_filter=vocab_subset_filter, 
-                    test_data_path=data_paths[i])
-                acc_debias,_ = self.manual_prompt(
-                    relation, debias=True, 
-                    vocab_subset_filter=vocab_subset_filter, 
-                    test_data_path=data_paths[i],
-                    bias_tensor=bias_tensors[i])
-                diff = acc_debias - acc_origin
-                print("{} 原始精度{} debias精度{}".format(
-                    "lama" if i==0 else "uni",
-                    round(acc_origin*100,2),
-                    round(acc_debias*100,2)))
-                total_diff[i].append(diff)
-                f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
-                f.flush()
-                pbar.update(1)
-                
-                postfox = {
-                    "lama_improve": 0 if ctrl_code[0]==0 or len(total_diff[0])==0 else round(sum(total_diff[0])/len(total_diff[0]), 3) * 100,
-                    "uni_improve": 0 if ctrl_code[1]==0 or len(total_diff[1])==0 else round(sum(total_diff[1])/len(total_diff[1]), 3) * 100,
-                    }
-
-                pbar.set_postfix(postfox)
-        
-        pbar.close()
-
-        """废弃函数"""
-    
-    """废弃函数"""
-    def experiment_answer_subset_bias(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", ctrl_code=[1,1]):
-        """
-        测试answer子空间上能否debias成功
-        """
-        lama_save_path = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/debias/lama_answer_entities_debias.csv"
-        uni_save_path = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/debias/uni_answer_entities_debias.csv"
-        save_paths = [lama_save_path,uni_save_path]
-        # self.relations = ["P19"]
-        pbar = tqdm(total=len(self.relations)*sum(ctrl_code))
-        total_diff = [[],[]]
-
-        for relation in self.relations:
-            lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-            uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
-            data_paths = [lama_data_path,uni_data_path]
-            # 构建两个bias tensor, 在本实验中，bias均选取的是M(T)因此，是一样的
-            bias_tensor_path = f"/home/jiao/code/prompt/OptiPrompt/model_bias_data/bert/manual_prompt/{relation}/full/model_bias.csv"
-            full_bias_tensor = torch.from_numpy(pd.read_csv(bias_tensor_path).values).squeeze()
-            answer_entity_indices = self.get_answer_entity_indices(relation, self.tokenizer)
-
-            # 做一个softmax
-            bias_tensor = torch.softmax(full_bias_tensor[answer_entity_indices],dim=0)
-            bias_tensors = [bias_tensor, bias_tensor]
-
-            for i in range(len(data_paths)):
-                if ctrl_code[i]==0:
-                    continue
-
-                f = open(save_paths[i], "w")
-                acc_origin,_ = self.manual_prompt(
-                    relation, debias=False, 
-                    vocab_subset_filter=vocab_subset_filter, 
-                    vocab_subset=vocab_subset,
-                    test_data_path=data_paths[i])
-                acc_debias,_ = self.manual_prompt(
-                    relation, debias=True, 
-                    vocab_subset_filter=vocab_subset_filter, 
-                    vocab_subset=vocab_subset,
-                    test_data_path=data_paths[i],
-                    bias_tensor=bias_tensors[i])
-                diff = acc_debias - acc_origin
-                print("{} 原始精度{} debias精度{}".format(
-                    "lama" if i==0 else "uni",
-                    round(acc_origin*100,2),
-                    round(acc_debias*100,2)))
-                total_diff[i].append(diff)
-                f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
-                f.flush()
-                pbar.update(1)
-                
-                postfox = {
-                    "lama_improve": 0 if ctrl_code[0]==0 or len(total_diff[0])==0 else round(sum(total_diff[0])/len(total_diff[0]), 3) * 100,
-                    "uni_improve": 0 if ctrl_code[1]==0 or len(total_diff[1])==0 else round(sum(total_diff[1])/len(total_diff[1]), 3) * 100,
-                    }
-
-                pbar.set_postfix(postfox)
-        pbar.close()
-    
-    """废弃函数"""
-    def generate_bias_dataset(self, relation, vocab_subset_filter, vocab_subset="common_vocab", round_num=-1, sparse=False):
-        """
-        生成特定relation分析prompt需要的数据
-        目前仅支持手工模板
-        round_num 表示是否开启舍入，用来节省空间 
-        sparseb表示是否开启稀疏存储，用来节省空间
-        save_logits_tensor表示不再使用json文本格式来稀疏存储了，而是转为使用
-
-        #TODO:支持连续模板
-        """
-        if sparse and round_num <=0:
-            print("没有开启舍入，稀疏存储不起作用")
-            exit(-1)
-
-        # 获取预训练模型
-        plm, tokenizer, model_config, WrapperClass = load_plm("bert", "bert-base-cased")
-        # 根据当前模型，构造出来lama subset indices
-        if vocab_subset_filter:
-            if vocab_subset=="common_vocab":
-                subset_indices = self.get_common_vocab_indices(tokenizer)
-            elif vocab_subset == "answer_type_tokens":
-                subset_indices = self.get_answer_entity_indices(relation,tokenizer)
-            else:
-                raise ValueError(f"参数值{vocab_subset}不符合要求")
-            subset_indices_list = subset_indices.tolist()
-
-        else:
-            subset_indices = None
-            subset_indices_list = None
-        
-        raw_template = self.lama_template[relation]
-        
-        prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]",self.tokenizer.mask_token)
-        bias = self.generate_model_bias(plm,tokenizer,
-            prompt_only_template,
-            vocab_subset_indices =subset_indices)
-        if vocab_subset_filter:
-            words = tokenizer.convert_ids_to_tokens(subset_indices)
-        
-        subvocab_name = "common_vocab" if vocab_subset=="common_vocab" else "answer_type_tokens"
-        
-        model_bias_save_path = "model_bias_data/bert/manual_prompt/{}/{}/model_bias.jsonl".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-
-        model_bias_csv_save_path = "model_bias_data/bert/manual_prompt/{}/{}/model_bias.csv".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-
-        self.create_dir(model_bias_save_path)
-        self.create_dir(model_bias_csv_save_path)
-
-        f = open(model_bias_save_path,"w")
-        f_csv = open(model_bias_csv_save_path, "w")
-
-        csv_title = [f"{i}" for i in range(bias.shape[0])]
-        f_csv.write(",".join(csv_title))
-        f_csv.write("\n")
-
-        for i in range(bias.shape[0]):
-            item = {"index": i,
-                    "ori_index": subset_indices[i].item() if vocab_subset_filter else i,
-                    "word": words[i] if vocab_subset_filter else tokenizer.convert_ids_to_tokens(i),
-                    "prob": bias[i].item()}
-            item_str = json.dumps(item)
-            f.write(item_str+'\n')
-
-            if i>0:
-                f_csv.write(",{}".format(bias[i].item()))
-            else:
-                f_csv.write("{}".format(bias[i].item()))
-        
-        f_csv.write("\n")
-
-
-        f.close()
-        f_csv.close()
-
-
-        
-        # 将模板转换成openprompt
-        template = raw_template.replace("[X]",'{"placeholder":"text_a"}')
-        template = template.replace("[Y]", '{"mask"}')
-        prompt_template = ManualTemplate(tokenizer=tokenizer, text=template)
-        # 准备prompt Model
-        promptModel = PromptModel(
-            template = prompt_template,
-            plm = plm,
-            freeze_plm=True
-        )
-        promptModel.cuda()
-        
-
-        # 加载lama数据集
-        lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-        raw_lama_data, _ = self.load_data(lama_data_path, vocab_subset=self.lama_vocab_subset,)
-        lama_dataset = self.wrap_input_examples(raw_lama_data, tokenizer)
-        
-        max_tokens_len = self.compute_max_pad({"test":lama_dataset}, WrapperClass, tokenizer, prompt_template)
-        lama_dataloader = PromptDataLoader(dataset=lama_dataset, template=prompt_template, tokenizer=tokenizer,
-            tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
-            batch_size=16,shuffle=False)
-        # 加载wiki-wni数据集
-        wiki_uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
-        raw_uni_data, _ = self.load_data(wiki_uni_data_path, vocab_subset=self.lama_vocab_subset,)
-        uni_dataset = self.wrap_input_examples(raw_uni_data, tokenizer)
-        
-        max_tokens_len = self.compute_max_pad({"test":uni_dataset}, WrapperClass, tokenizer, prompt_template)
-        uni_dataloader = PromptDataLoader(dataset=uni_dataset, template=prompt_template, tokenizer=tokenizer,
-            tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
-            batch_size=16,shuffle=False)
-        
-        lama_data_save_path = "model_bias_data/bert/manual_prompt/{}/{}/lama_data.jsonl".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-        uni_data_save_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_data.jsonl".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-        lama_data_csv_save_path = "model_bias_data/bert/manual_prompt/{}/{}/lama_data.csv".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-        uni_data_csv_save_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_data.csv".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-        lama_label_csv_path = "model_bias_data/bert/manual_prompt/{}/{}/lama_label.csv".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-        uni_label_csv_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_label.csv".format(
-            relation,subvocab_name if vocab_subset_filter else "full")
-        
-
-
-        dataloaders = [lama_dataloader, uni_dataloader]
-        save_paths = [lama_data_save_path,uni_data_save_path]
-        save_csv_paths = [lama_data_csv_save_path, uni_data_csv_save_path]
-        raw_datasets  = [raw_lama_data, raw_uni_data]
-        label_save_paths = [lama_label_csv_path, uni_label_csv_path]
-
-        for dataloader, save_path, save_csv_path,label_csv_path,raw_dataset in zip(dataloaders,save_paths,save_csv_paths,label_save_paths, raw_datasets):
-            self.create_dir(save_path)
-            f = open(save_path,"w")
-            f_csv = open(save_csv_path, "w")
-            label_csv = open(label_csv_path,"w")
-
-            if vocab_subset_filter:
-                acc1,(probs, preds, labels ) = self.evaluate(promptModel,dataloader,vocab_subset_indices=subset_indices)
-                
-            else:
-                acc1,(probs, preds, labels ) = self.evaluate(promptModel,dataloader)
-            
-            
-            # 数据csv title
-            probs_num = probs.shape[-1]
-            csv_title = [f"{i}" for i in range(probs_num)]
-            f_csv.write(",".join(csv_title))
-            f_csv.write("\n")
-
-            # label csv title
-            label_csv.write("label,pred\n")
-            
-
-            for i in range(len(preds)):
-                item = {}
-                item["sub_label"] = raw_dataset[i]["sub_label"]
-                item["obj_label"] = raw_dataset[i]["obj_label"]
-                # pred和label为原始词表，需要转成vocab_subset的index
-                if vocab_subset_filter:
-                    item["pred"] = subset_indices_list.index(preds[i])
-                    item["label"] = subset_indices_list.index(labels[i])
-                else:
-                    item["pred"] = preds[i]
-                    item["label"] = labels[i]
-                item["probs"] = probs[i].cpu().tolist()
-
-                # 写入label csv中
-                label_csv.write(f'{item["label"]},{item["pred"]}\n')
-
-                if round_num>0:
-                    round_res = torch.floor(probs[i] * math.pow(10,round_num)) / math.pow(10,round_num)
-                    # round 可能会造成某些概率非常近似的两个logit无法区分，如果正好是pred这个logit那么就会带来错误
-                    # 因此这里对这种特殊情况做一个处理
-                    pred_index = item["pred"]
-                    round_res[pred_index] = item["probs"][pred_index]
-                    
-                    item["probs"] = round_res.tolist()
-                    values = [round(i, round_num) for i in item["probs"]]
-                    values[pred_index] = item["probs"][pred_index]
-                    item["probs"] = values
-                    csv_item = [str(i) for i in item["probs"]]
-                    csv_content = ",".join(csv_item)
-                    f_csv.write(csv_content)
-                    f_csv.write("\n")
-
-                    item["probs"] = torch.tensor(values).cuda()
-
-                if sparse:
-                    non_zero = torch.nonzero(item["probs"]).squeeze(dim=1)
-                    prob_output = {"len":len(non_zero),
-                                    "nonzero_index":non_zero.tolist(),
-                                    }
-                    values = item["probs"][non_zero].tolist()
-                    prob_output["values"] = values
-                    item["probs"] = prob_output
-                else:
-                    item["probs"] = item["probs"].tolist()
-                
-                f.write(json.dumps(item))
-                f.write('\n')
-            
-            f.close()
-            f_csv.close()
-
-    """废弃函数"""
-    def check_bias_dataset(self, model_bias, dataset):
-        """该函数用来校验生成的bias数据集是否存在问题"""
-        model_bias = load_jsonl(model_bias)
-        dataset = load_jsonl(dataset)
-
-        # 构建vocab_subset的索引字典
-        subset_index = dict([(item["index"],item["word"]) for item in model_bias])
-
-        correct = 0
-        for data in dataset:
-            # 检查1 probs最大值索引是否是预测值
-            pred = data["pred"]
-            prob_max_index = data["probs"]["values"].index(max(data["probs"]["values"]))
-            prob_max = data["probs"]["nonzero_index"][prob_max_index]
-            assert pred == prob_max
-            if pred == data["label"]:
-                correct += 1
-            # 检查2 检查当前数据的Lbael对应的字符串是否是obj_label
-            assert data["obj_label"] == subset_index[data["label"]]
-
-        print("检查通过-数据集的精度为{}".format(correct/len(dataset)))
-
-    """废弃函数"""
-    def generate_bias_datasets(self, round_num=-1, sparse=False, ):
-        #TODO 增加不同的子词过滤
-        self.relations = ["P19"]
-        pbar = tqdm(total=len(self.relations)*2)
-        for relation in self.relations:
-            for vocab_subset_filter in [True, False]:
-                self.generate_bias_dataset(relation, vocab_subset_filter,round_num,sparse)
-                model_bias_save_path = "model_bias_data/bert/manual_prompt/{}/{}/model_bias.jsonl".format(
-                    relation, "subvocab_filter" if vocab_subset_filter else "full")
-                lama_data_save_path = "model_bias_data/bert/manual_prompt/{}/{}/lama_data.jsonl".format(
-                    relation, "subvocab_filter" if vocab_subset_filter else "full")
-                uni_data_save_path = "model_bias_data/bert/manual_prompt/{}/{}/uni_data.jsonl".format(
-                    relation, "subvocab_filter" if vocab_subset_filter else "full")
-                self.check_bias_dataset(model_bias_save_path,lama_data_save_path)
-                self.check_bias_dataset(model_bias_save_path,uni_data_save_path)
-                pbar.update(1)
-        pbar.close()
-
-    """废弃函数"""
-    def experiment_renormal_vector_difference_bias(self, relation):
-        """
-        实验在向量空间里，对输出特征归一化后，消除数量级不同的影响做减法是否有效
-        """
-        # 关键的一点在分开bert和cls的操作
-        tokenizer = self.tokenizer
-        model = self.plm
-        config = self.model_config
-        transformer_blocks = model.bert
-        model_cls = model.cls
-        raw_bias = model.cls.predictions.decoder.bias.data.clone()
-        answer_type_indices = self.get_answer_entity_indices("P19",tokenizer=tokenizer)
-
-        # renormal = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        # renormal.weight.data = model.cls.predictions.decoder.weight.data.clone()
-        # renormal.weight.data = F.normalize(renormal.weight.data, p=2,dim=1)
-        # # renormal.bias = model.cls.predictions.decoder.bias
-        # model.set_output_embeddings(renormal)
-        # model.bert.embeddings.word_embeddings.weight = renormal.weight
-
-
-        raw_template = self.lama_template[relation]
-        lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-        uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
-        lama_vocab_subset = load_vocab(self.common_vocab_path)
-        raw_test_data, _ = self.load_data(uni_data_path, vocab_subset=lama_vocab_subset,)
-
-        correct = 0
-        total = 0
-
-        # 关键: 构建出来一个renormalized bias logits
-        prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]",self.tokenizer.mask_token)
-        model_input = tokenizer(prompt_only_template,return_tensors="pt")
-        bias_bert = transformer_blocks(**model_input)[0]
-         # 找到[MASK]的位置
-        y_mask_index = 0
-        mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-        input_token_ids = model_input["input_ids"][0].tolist()
-        for i,e in enumerate(reversed(input_token_ids)):
-            if e == mask_id:
-                y_mask_index = -(i+1) 
-                break
-        assert y_mask_index < 0
-
-        bias_bert = bias_bert[0][y_mask_index]
-
-        # 这个transform层的意义我不清楚，但是很重要，这才算是得到了特征向量
-        bias_features = model.cls.predictions.transform(bias_bert)
-        norm2 = torch.norm(bias_features)
-        model.cls.predictions.decoder.bias.data = raw_bias / norm2
-        bias_features_renormal = F.normalize(bias_features,p=2,dim=-1)
-        bias_logits = model_cls.predictions.decoder(bias_features_renormal)           
-
-
-        f = open("debias/P19_bias.csv","w")
-        f.write("label,pred\n")     
-
-        for data in raw_test_data:
-            input_sentence = raw_template.replace("[X]",data["sub_label"])
-            input_sentence = input_sentence.replace("[Y]",self.tokenizer.mask_token)
-            model_input = tokenizer(input_sentence,return_tensors="pt")
-            # model_input = {k: v.cuda() for k, v in model_input.items()}
-
-            # 关键: 归一化
-            transformer_output =   transformer_blocks(**model_input)[0]
-            # 找到[MASK]的位置
-            y_mask_index = 0
-            mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-            input_token_ids = model_input["input_ids"][0].tolist()
-            for i,e in enumerate(reversed(input_token_ids)):
-                if e == mask_id:
-                    y_mask_index = -(i+1) 
-                    break
-            assert y_mask_index < 0
-            mask_token_bert = transformer_output[0][y_mask_index]
-            mask_token_features = model.cls.predictions.transform(mask_token_bert)
-            # mask_token_origin = model_cls(mask_token_bert)\
-
-            norm2 = torch.norm(mask_token_features, p=2)
-            model.cls.predictions.decoder.bias.data = raw_bias / norm2
-            mask_token_features_renormal = F.normalize(mask_token_features,p=2,dim=-1)
-            mask_token_logits = model_cls.predictions.decoder(mask_token_features_renormal)
-
-            # 关键: debias
-            mask_token_logits -= bias_logits
-            
-            # 加上过滤
-            filtered_mask_token_logits = mask_token_logits[answer_type_indices]
-
-    
-            answer_type_index = torch.argmax(filtered_mask_token_logits).item()
-            pred = answer_type_index
-            vocab_label = tokenizer.convert_tokens_to_ids(data["obj_label"])
-            label = answer_type_indices.tolist().index(vocab_label)
-            if pred == label:
-                correct += 1
-            total += 1
-
-            # 导出来一个分布-在answer空间下的序列
-            f.write(f"{label},{pred}\n")
-        
-        print(correct/total)
-        f.close()
-
-    """废弃函数"""
-    def experiment_renormal_raw_manual_prompt(self, relation):
-        """
-        测试关于是否可以把decoder的weight renormal
-        """
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-        model = AutoModelForMaskedLM.from_pretrained("bert-base-cased")
-        config = AutoConfig.from_pretrained("bert-base-cased")
-
-        renormal = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        renormal.weight.data = model.cls.predictions.decoder.weight.data.clone()
-        renormal.weight.data = F.normalize(renormal.weight.data, p=2,dim=1)
-        # renormal.bias = model.cls.predictions.decoder.bias
-        model.set_output_embeddings(renormal)
-        model.bert.embeddings.word_embeddings.weight = renormal.weight
-
-
-        raw_template = self.lama_template[relation]
-        lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-        # lama_data_path = os.path.join(self.auto_prompt_dir,relation,"test.jsonl")
-        lama_vocab_subset = load_vocab(self.common_vocab_path)
-        raw_test_data, _ = self.load_data(lama_data_path, vocab_subset=lama_vocab_subset,)
-
-        correct = 0
-        total = 0
-        for data in raw_test_data:
-            input_sentence = raw_template.replace("[X]",data["sub_label"])
-            input_sentence = input_sentence.replace("[Y]",self.tokenizer.mask_token)
-            model_input = tokenizer(input_sentence,return_tensors="pt")
-            # model_input = {k: v.cuda() for k, v in model_input.items()}
-            output = model(**model_input).logits
-
-            # 找到[MASK]的位置
-            y_mask_index = 0
-            mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-            input_token_ids = model_input["input_ids"][0].tolist()
-            for i,e in enumerate(reversed(input_token_ids)):
-                if e == mask_id:
-                    y_mask_index = -(i+1) 
-                    break
-            assert y_mask_index < 0
-            
-            mask_token = output[0][y_mask_index]
-            index = torch.argmax(mask_token).item()
-            if index == tokenizer.convert_tokens_to_ids(data["obj_label"]):
-                correct += 1
-            total += 1
-        
-        print(correct/total)
-
-    """废弃函数"""
-    def experiment_renormlize_accord_for_bias(self, relation):
-        """该函数用来测试bias是否来与embeddings不均衡有关系"""
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-        model = AutoModelForMaskedLM.from_pretrained("bert-base-cased")
-        config = AutoConfig.from_pretrained("bert-base-cased")
-        raw_template = self.lama_template[relation]
-        prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]",self.tokenizer.mask_token)
-        answer_type_tokens = self.get_answer_entity_indices(relation,tokenizer)
-        origin_bias = self.generate_model_bias(
-            model, tokenizer, prompt_only=prompt_only_template, vocab_subset_indices=answer_type_tokens, return_logits=True)
-        
-
-
-        # 修改模型embeddings
-        renormal = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        renormal.weight.data = model.cls.predictions.decoder.weight.data.clone()
-        renormal.weight.data = F.normalize(renormal.weight.data, p=2,dim=1)
-        # renormal.bias = model.cls.predictions.decoder.bias
-        model.set_output_embeddings(renormal)
-        model.bert.embeddings.word_embeddings.weight = renormal.weight
-
-        renormal_bias = self.generate_model_bias(
-            model, tokenizer, prompt_only=prompt_only_template, vocab_subset_indices=answer_type_tokens, return_logits=True)
-
-        self.create_dir("debias/origin_bias.pt")
-        torch.save(origin_bias,"debias/origin_bias.pt")
-        torch.save(renormal_bias,"debias/renormal_bias.pt")
-    
-    """废弃函数"""
-    def experiment_renormal_vector_difference_bias_with_renormal_embedding(self, relation):
-        """
-        实验在renormal后的向量空间里，对输出特征归一化后，消除数量级不同的影响做减法是否有效
-        """
-        # 关键的一点在分开bert和cls的操作
-        tokenizer = self.tokenizer
-        model = self.plm
-        config = self.model_config
-        transformer_blocks = model.bert
-        model_cls = model.cls
-        raw_bias = model.cls.predictions.decoder.bias.data.clone()
-        answer_type_indices = self.get_answer_entity_indices("P19",tokenizer=tokenizer)
-
-        renormal = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        renormal.weight.data = model.cls.predictions.decoder.weight.data.clone()
-        renormal.weight.data = F.normalize(renormal.weight.data, p=2,dim=1)
-        # renormal.bias = model.cls.predictions.decoder.bias
-        model.set_output_embeddings(renormal)
-        model.bert.embeddings.word_embeddings.weight = renormal.weight
-
-
-        raw_template = self.lama_template[relation]
-        lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-        uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
-        lama_vocab_subset = load_vocab(self.common_vocab_path)
-        raw_test_data, _ = self.load_data(uni_data_path, vocab_subset=lama_vocab_subset,)
-
-        correct = 0
-        total = 0
-
-        # 关键: 构建出来一个renormalized bias logits
-        prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]",self.tokenizer.mask_token)
-        model_input = tokenizer(prompt_only_template,return_tensors="pt")
-        bias_bert = transformer_blocks(**model_input)[0]
-         # 找到[MASK]的位置
-        y_mask_index = 0
-        mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-        input_token_ids = model_input["input_ids"][0].tolist()
-        for i,e in enumerate(reversed(input_token_ids)):
-            if e == mask_id:
-                y_mask_index = -(i+1) 
-                break
-        assert y_mask_index < 0
-
-        bias_bert = bias_bert[0][y_mask_index]
-
-        # 这个transform层的意义我不清楚，但是很重要，这才算是得到了特征向量
-        bias_features = model.cls.predictions.transform(bias_bert)
-        # norm2 = torch.norm(bias_features)
-        # model.cls.predictions.decoder.bias.data = raw_bias / norm2
-        bias_features_renormal = F.normalize(bias_features,p=2,dim=-1)
-        bias_logits = model_cls.predictions.decoder(bias_features_renormal)           
-
-
-        f = open("debias/P19_bias.csv","w")
-        f.write("label,pred\n")     
-
-        for data in raw_test_data:
-            input_sentence = raw_template.replace("[X]",data["sub_label"])
-            input_sentence = input_sentence.replace("[Y]",self.tokenizer.mask_token)
-            model_input = tokenizer(input_sentence,return_tensors="pt")
-            # model_input = {k: v.cuda() for k, v in model_input.items()}
-
-            # 关键: 归一化
-            transformer_output =   transformer_blocks(**model_input)[0]
-            # 找到[MASK]的位置
-            y_mask_index = 0
-            mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-            input_token_ids = model_input["input_ids"][0].tolist()
-            for i,e in enumerate(reversed(input_token_ids)):
-                if e == mask_id:
-                    y_mask_index = -(i+1) 
-                    break
-            assert y_mask_index < 0
-            mask_token_bert = transformer_output[0][y_mask_index]
-            mask_token_features = model.cls.predictions.transform(mask_token_bert)
-            # mask_token_origin = model_cls(mask_token_bert)\
-
-            # norm2 = torch.norm(mask_token_features, p=2)
-            # model.cls.predictions.decoder.bias.data = raw_bias / norm2
-            mask_token_features_renormal = F.normalize(mask_token_features,p=2,dim=-1)
-            mask_token_logits = model_cls.predictions.decoder(mask_token_features_renormal)
-
-            # 关键: debias
-            # mask_token_logits = torch.acos(mask_token_logits)
-            # bias_logits = torch.acos(bias_logits)
-            mask_token_logits -= bias_logits
-            # mask_token_logits *= -1
-            
-            # 加上过滤
-            filtered_mask_token_logits = mask_token_logits[answer_type_indices]
-
-    
-            answer_type_index = torch.argmax(filtered_mask_token_logits).item()
-            pred = answer_type_index
-            vocab_label = tokenizer.convert_tokens_to_ids(data["obj_label"])
-            label = answer_type_indices.tolist().index(vocab_label)
-            if pred == label:
-                correct += 1
-            total += 1
-
-            # 导出来一个分布-在answer空间下的序列
-            f.write(f"{label},{pred}\n")
-        
-        print(correct/total)
-        f.close()
-
-
-exp = Experiment()
-# exp.continue_prompt("P19",continue_prompt="optiprompt")
-output_dir = "/home/jiao/code/prompt/OptiPrompt/outputs/openprompt/result_statistic"
-# exp.num_epochs = 10
-# exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-# exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-# exp.save_output(output_dir+"/bert/continue/bert_vocab_intersection_result.json")
-
-# exp.num_epochs = 10
-# exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="prefix",num_tokens=5)
-# exp.save_output(output_dir+"/bert/continue/perfix_5/bert_vocab_intersection_result.json")
-# # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",embeddings_renormalize=True)
-exp.init_model("bert","bert-base-cased")
-exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result.json")
-exp.clear_output()
-
-exp.init_model("bert","bert-large-cased")
-exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased.txt")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-exp.save_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result.json")
-exp.clear_output()
-
-exp.init_model("roberta","roberta-large")
-exp.init_common_vocab("/home/jiao/code/prompt/OptiPrompt/common_vocabs/common_vocab_cased_be_ro_al.txt")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-exp.save_output(output_dir+"/roberta-large/roberta_vocab_intersection_result.json")
-exp.clear_output()
+if __name__ == '__main__':
+    exp = Experiment()
+    # exp.continue_prompt("P19",continue_prompt="optiprompt")
+    output_dir = exp.work_dir + "/outputs/openprompt/result_statistic"
+    # exp.num_epochs = 10
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+    # exp.save_output(output_dir+"/bert/continue/bert_vocab_intersection_result.json")
+
+    # exp.num_epochs = 10
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="prefix",num_tokens=5)
+    # exp.save_output(output_dir+"/bert/continue/perfix_5/bert_vocab_intersection_result.json")
+    # # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",embeddings_renormalize=True)
+    # exp.init_model("bert","bert-base-cased")
+    # exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+    # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result.json")
+    # exp.load_output("outputs/openprompt/result_statistic/roberta-large/roberta_vocab_intersection_result.json")
+    # exp.print_output()
+    # exp.clear_output()
+
+
+    # exp.init_model("bert","bert-large-cased")
+    # exp.init_common_vocab(self.work_dir + "/common_vocabs/common_vocab_cased.txt")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+    # exp.save_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result.json")
+    # exp.clear_output()
+
+    # exp.init_model("bert","nsadeq/InformBERT")
+    # exp.init_common_vocab(self.work_dir + "/common_vocabs/common_vocab_cased.txt")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+    # exp.save_output(output_dir+"/InformBert/bert_vocab_intersection_result.json")
+    # exp.clear_output()
+
+    exp.init_model("roberta","roberta-large")
+    # exp.relations = ["P37"]
+    exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
+
+    # exp.raw_manual_prompt("P37",PLM="roberta-large",prompt="AutoPrompt")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",ctrl_code=[1,1,1])
+    exp.learning_rate = 6e-3
+    exp.num_epochs = 20
+    exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5, repeat_times=1, )
+    # exp.save_output(output_dir+"/roberta-large/roberta_vocab_intersection_result.json")
+    exp.print_output()
+    exp.clear_output()
+
+    # exp.init_model("roberta","roberta-large")
+    # exp.init_common_vocab(self.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",ctrl_code=[1,0,0])
+
+    # exp.load_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result.json")
+    # exp.print_output()
+    # exp.clear_output()
+    # exp.load_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result.json")
+    # exp.print_output()
+    # exp.clear_output()
+    # exp.load_output(output_dir+"/roberta-large/roberta_vocab_intersection_result.json")
+    # exp.print_output()
+    # exp.clear_output()
