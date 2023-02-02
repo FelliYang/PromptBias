@@ -1,5 +1,7 @@
 # output dir
 outputs/
+# temp dir
+temp/
 # data dir
 data/
 # vscode

@@ -132,10 +132,10 @@ class Experiment():
                 for prompt in dataset_output.keys():
                     prompt_output = dataset_output[prompt]
                     P,P_d,KL,KL_d = prompt_output['P'], prompt_output["P_d"], prompt_output["KL"], prompt_output["KL_d"]
-                    P = round(P*100,2)
-                    P_d = round(P_d*100,2)
-                    KL = round(KL,2)
-                    KL_d = round(KL_d,2)
+                    P = math.floor(P *100 * 10+0.5)/10
+                    P_d = math.floor(P_d *100 * 10+0.5)/10
+                    KL = math.floor(KL * 10+0.5)/10
+                    KL_d = math.floor(KL_d * 10+0.5)/10
                     table.add_row(["",prompt,P,P_d,KL,KL_d])
             print(table)
                     
@@ -379,7 +379,7 @@ class Experiment():
         norm2 = torch.norm(bias_features)
         bias_logits = decoder(bias_features) / norm2
 
-        return bias_logits    
+        return bias_logits, bias_features    
 
 
     def generate_image(self,before_debias_preds, after_debias_preds, labels, model_bias, save_path="test.png"):
@@ -516,6 +516,7 @@ class Experiment():
 
         raw_test_data, _ = self.load_data(test_data_path, vocab_subset=self.lama_vocab_subset,)
         dataset["test"] = self.wrap_input_examples(raw_test_data, tokenizer,autoprompt_postfix=autoprompt_postfix)
+        sub_labels = [d["sub_label"] for d in raw_test_data]
 
 
         # 将模板转换成openprompt
@@ -526,7 +527,7 @@ class Experiment():
 
         # 定义prompt_pnly_tempalte用于计算bias
         prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
-        bias_logits = self.get_template_bias_tensor(model,tokenizer,template=prompt_only_tempalte)
+        bias_logits, bias_vector = self.get_template_bias_tensor(model,tokenizer,template=prompt_only_tempalte)
     
 
 
@@ -534,6 +535,7 @@ class Experiment():
         # 计算lama需要的最大pad数量
         max_tokens_len = self.compute_max_pad(dataset, WrapperClass, tokenizer, prompt_template)
 
+        # Note:这里不能shuffle，否则导出的sub_label顺序将会出错
         test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=tokenizer,
             tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
             batch_size=16,shuffle=False)
@@ -549,7 +551,7 @@ class Experiment():
 
         # 开始预测
         if debias:
-            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, vocab_subset_indices=subset_indices)
+            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector,scaling_debiased_logit=True, vocab_subset_indices=subset_indices)
         else:
             acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
 
@@ -560,7 +562,7 @@ class Experiment():
             self.plm.set_output_embeddings(output_embedding_backup)
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
 
-        return round(acc,5), (probs, allpreds, alllabels)
+        return round(acc,5), (probs, sub_labels, allpreds, alllabels)
 
 
     def run_manual_prompt_all_relation(self,vocab_subset="common_vocab", embeddings_renormalize=False):
@@ -613,6 +615,8 @@ class Experiment():
         self.create_dir(KL_save_path)
         KL_save_f = open(KL_save_path,"w")
         KL_save_f.write("Relation")
+        preds_save_path = os.path.join(root_dir, f"{save_dir}/preds.pt")
+
 
         total_diff = [[],[],[]]
         # 保存所有精度和所有KL散度
@@ -621,7 +625,13 @@ class Experiment():
                         "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[]},
                         "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
                       }
-
+ 
+        # 保存所有预测结果
+        preds_save = {
+            "LAMA": {},
+            "WIKI-UNI": {},
+            "LAMA-WHU":{},
+        }
 
         for i in range(dataset_num):
             save_path = os.path.join(root_dir, f"{save_dir}/{dataset_names[i]}_difference_debias.csv") 
@@ -680,13 +690,13 @@ class Experiment():
                 if ctrl_code[i]==0:
                     continue
                 f = files[i]
-                acc_origin,(_, preds_before, labels) = self.manual_prompt(
+                acc_origin,(probs_before, sub_labels, preds_before, labels) = self.manual_prompt(
                     relation, debias=False, 
                     vocab_subset_filter=vocab_subset_filter,
                     vocab_subset=vocab_subset,
                     test_data_path=data_paths[i],
                     prompt=manual_prompt)
-                acc_debias,(_, preds_after, _) = self.manual_prompt(
+                acc_debias,(probs_after,_, preds_after, _) = self.manual_prompt(
                     relation, debias=True, 
                     vocab_subset_filter=vocab_subset_filter, 
                     vocab_subset=vocab_subset,
@@ -697,22 +707,30 @@ class Experiment():
                 output_save[dataset]["P"].append(acc_origin)
                 output_save[dataset]["P_d"].append(acc_debias)
                 
+                # 保存preds结果
+                obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
+                raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
+                debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
+                indices = list(range(len(sub_labels)))
+                preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
 
-                # 计算出来分布，用于绘图
+                # 计算出来分布，用于绘图和计算KL散度
                 num_data = len(preds_before)
-                preds_before_count =  Counter(preds_before)
-                preds_before_dis = defaultdict(int,
-                                                 {key: preds_before_count[key]/num_data
-                                                 for key in preds_before_count.keys()}
-                                                 )
-                preds_after_count = Counter(preds_after)
-                preds_after_dis = defaultdict(int,
-                                                 {key: preds_after_count[key]/num_data 
-                                                    for key in preds_after_count.keys()}
-                                                 )
                 
-                KL_before = round(self.kl_divergence(bias_dis, preds_before_dis),5)
-                KL_after = round(self.kl_divergence(bias_dis, preds_after_dis),5)
+                probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
+                probs_dis_after = torch.softmax(probs_after,dim=-1).tolist()
+                KL_before_list = []
+                KL_after_list = []
+                for index in range(num_data):
+                    probs_dis_before_i = probs_dis_before[index]
+                    probs_dis_after_i = probs_dis_after[index]
+                    probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
+                    probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
+                    KL_before_list.append(self.kl_divergence(bias_dis, probs_dis_before_i))
+                    KL_after_list.append(self.kl_divergence(bias_dis, probs_dis_after_i))
+
+                KL_before = round(np.mean(KL_before_list),5)
+                KL_after = round(np.mean(KL_after_list),5) 
 
                 output_save[dataset]["KL"].append(KL_before)
                 output_save[dataset]["KL_d"].append(KL_after)
@@ -775,6 +793,8 @@ class Experiment():
             self.add_output_item(self.model_name, dataset,prompt=manual_prompt,result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
         
         self.print_output()
+
+        torch.save(preds_save,preds_save_path)
                 
 
 
@@ -784,11 +804,12 @@ class Experiment():
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
 
 
-    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3):
+    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False):
         """
         ctrl_code 代表需要测试的数据集， 包扩[lama, wiki-uni, lama_whu]
         continue_prompt 表示使用某个连续模板 支持prefix和optiprompt
         repeated_times用于表示重复次数
+        evaluate_model 为true表示不训练，加载最好的epoch
         """
 
         pbar = tqdm(total=len(self.relations)*repeat_times)
@@ -829,6 +850,7 @@ class Experiment():
             self.create_dir(KL_save_path)
             KL_save_f = open(KL_save_path,"w")
             KL_save_f.write("Relation")
+            preds_save_path = os.path.join(root_dir, f"{save_dir}/preds.pt")
 
             total_diff = [[],[],[]]
             # 保存所有精度和所有KL散度
@@ -838,6 +860,12 @@ class Experiment():
                             "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
                         }
 
+            # 保存所有预测结果
+            preds_save = {
+                "LAMA": {},
+                "WIKI-UNI": {},
+                "LAMA-WHU":{},
+            }
             
             for i in range(dataset_num):
                 save_path = os.path.join(root_dir, f"{save_dir}/{dataset_names[i]}_difference_debias.csv")
@@ -856,7 +884,7 @@ class Experiment():
             for relation in self.relations:
                 
                 model_bias, results = self.continue_prompt(relation, embedding_save_dir=os.path.join(root_dir,save_dir),vocab_subset_filter=vocab_subset_filter,
-                                                                        vocab_subset=vocab_subset,continue_prompt=continue_prompt,num_tokens=num_tokens)
+                                                                        vocab_subset=vocab_subset,continue_prompt=continue_prompt,num_tokens=num_tokens, evaluate_mode=evaluate_mode)
                 
                 subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
                                                         if vocab_subset == "answer_type_tokens" else \
@@ -872,28 +900,37 @@ class Experiment():
                 for i in range(len(dataset_names)):
                     f = files[i]
                     debias_res,origin_res = results[dataset_names[i]]
-                    acc_origin,(_, preds_before, labels) = origin_res
-                    acc_debias,(_, preds_after, _) = debias_res
+                    acc_origin,(probs_before, sub_labels, preds_before, labels) = origin_res
+                    acc_debias,(probs_after,_,  preds_after, _) = debias_res
                     dataset = list(output_save.keys())[i]
                     output_save[dataset]["P"].append(acc_origin)
                     output_save[dataset]["P_d"].append(acc_debias)
 
+                    # 保存preds结果
+                    obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
+                    raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
+                    debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
+                    indices = list(range(len(sub_labels)))
+                    preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
 
+                    # 计算出来分布，用于绘图和计算KL散度
                     num_data = len(preds_before)
-                    preds_before_count =  Counter(preds_before)
-                    preds_before_dis = defaultdict(int,
-                                                        {key: preds_before_count[key]/num_data
-                                                        for key in preds_before_count.keys()}
-                                                        )
-                    preds_after_count = Counter(preds_after)
-                    preds_after_dis = defaultdict(int,
-                                                        {key: preds_after_count[key]/num_data 
-                                                        for key in preds_after_count.keys()}
-                                                        )
-                    
-                    KL_before = round(self.kl_divergence(bias_dis, preds_before_dis),5)
-                    KL_after = round(self.kl_divergence(bias_dis, preds_after_dis),5)
-                    
+
+                    probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
+                    probs_dis_after = torch.softmax(probs_after,dim=-1).tolist()
+                    KL_before_list = []
+                    KL_after_list = []
+                    for index in range(num_data):
+                        probs_dis_before_i = probs_dis_before[index]
+                        probs_dis_after_i = probs_dis_after[index]
+                        probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
+                        probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
+                        KL_before_list.append(self.kl_divergence(bias_dis, probs_dis_before_i))
+                        KL_after_list.append(self.kl_divergence(bias_dis, probs_dis_after_i))
+
+                    KL_before = round(np.mean(KL_before_list),5)
+                    KL_after = round(np.mean(KL_after_list),5) 
+
                     output_save[dataset]["KL"].append(KL_before)
                     output_save[dataset]["KL_d"].append(KL_after)
 
@@ -978,6 +1015,7 @@ class Experiment():
             avg_KL_d = np.mean(KL_d)
             self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
 
+        torch.save(preds_save,preds_save_path)
 
         if embeddings_renormalize==True:
             output_embedding_backup = output_embedding_backup.to(self.plm.device)
@@ -1021,7 +1059,7 @@ class Experiment():
         return max_tokens_len
 
 
-    def continue_prompt(self, relation, embedding_save_dir, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none"):
+    def continue_prompt(self, relation, embedding_save_dir, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none", evaluate_mode=False):
         """
         对单个relation，训练出一个连续模板
         输出(model_bias, original_output, debiased_output)
@@ -1063,6 +1101,10 @@ class Experiment():
         dataset["test"]["uni"] = self.wrap_input_examples(raw_test_data[1], tokenizer)
         dataset["test"]["lama_whu"] = self.wrap_input_examples(raw_test_data[2], tokenizer)
         
+        sub_labels = {"lama":{},"uni":{},"lama_whu":{}}
+        sub_labels["lama"] = [d["sub_label"] for d in raw_test_data[0]]
+        sub_labels["uni"] = [d["sub_label"] for d in raw_test_data[1]]
+        sub_labels["lama_whu"] = [d["sub_label"] for d in raw_test_data[2]]
         
         if continue_prompt=="prefix":
             current_template = '{"placeholder":"text_a"} '
@@ -1124,61 +1166,65 @@ class Experiment():
             
         )
         promptModel.cuda()
+        best_ckpt = os.path.join(embedding_save_dir, f"weight_save/{relation}/model_full-prompt_random_init.ckpt")
+        if evaluate_mode==False:
+            # 开始训练
+            loss_func = torch.nn.CrossEntropyLoss()
+            no_decay = ['bias', 'LayerNorm.weight']
 
-        # 开始训练
-        loss_func = torch.nn.CrossEntropyLoss()
-        no_decay = ['bias', 'LayerNorm.weight']
+            optimizer_grouped_parameters = [
+                {'params': [p for n,p in promptModel.template.named_parameters() if "raw_embedding" not in n]}
+            ]
 
-        optimizer_grouped_parameters = [
-            {'params': [p for n,p in promptModel.template.named_parameters() if "raw_embedding" not in n]}
-        ]
+            optimizer = AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
+            t_total = len(dataset["train"]) * self.num_epochs
+            scheduler = get_cosine_schedule_with_warmup(optimizer, int(t_total * self.warmup_proportion), t_total)
 
-        optimizer = AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
-        t_total = len(dataset["train"]) * self.num_epochs
-        scheduler = get_cosine_schedule_with_warmup(optimizer, int(t_total * self.warmup_proportion), t_total)
+            time_start = time()
+            best_acc = 0
+            best_epoch = -1  
+            self.create_dir(best_ckpt)
+            for epoch in range(self.num_epochs):
+                promptModel.train()
+                tot_loss = 0
+                for step, inputs in enumerate(train_dataloader):
+                    inputs = inputs.cuda()
+                    logits = promptModel(inputs).logits
+                    mask_logits = logits[torch.where(inputs['loss_ids']>0)]
+                    loss = loss_func(mask_logits, inputs["label"])
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
-        time_start = time()
-        best_acc = 0
-        best_epoch = -1
-        save_name = os.path.join(embedding_save_dir, f"weight_save/{relation}/model_full-prompt_random_init.ckpt")  
-        self.create_dir(save_name)
-        for epoch in range(self.num_epochs):
-            promptModel.train()
-            tot_loss = 0
-            for step, inputs in enumerate(train_dataloader):
-                inputs = inputs.cuda()
-                logits = promptModel(inputs).logits
-                mask_logits = logits[torch.where(inputs['loss_ids']>0)]
-                loss = loss_func(mask_logits, inputs["label"])
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+                    tot_loss += loss.item()
+                    # print(tot_loss/(step+1))
+                # validate it
+            
+                acc,_ =  self.evaluate(promptModel, valid_dataloader,vocab_subset_indices=subset_indices)
+                if acc > best_acc:
+                    # 保存最好的epoch
+                    best_epoch = epoch
+                    best_acc = acc
+                    if continue_prompt=="prefix":
+                        soft_embeds = promptModel.template.state_dict()["soft_embeds"].clone()
+                    elif continue_prompt=='optiprompt':
+                        soft_embeds = promptModel.template.state_dict()["soft_embedding.weight"].clone()
+                    torch.save(soft_embeds,best_ckpt)
+                    
 
-                tot_loss += loss.item()
-                # print(tot_loss/(step+1))
-            # validate it
-           
-            acc,_ =  self.evaluate(promptModel, valid_dataloader,vocab_subset_indices=subset_indices)
-            if acc > best_acc:
-                # 保存最好的epoch
-                best_epoch = epoch
-                best_acc = acc
-                if continue_prompt=="prefix":
-                    soft_embeds = promptModel.template.state_dict()["soft_embeds"].clone()
-                elif continue_prompt=='optiprompt':
-                    soft_embeds = promptModel.template.state_dict()["soft_embedding.weight"].clone()
-                torch.save(soft_embeds,save_name)
-                
+            print("best epoch {} valid precision: {}".format(best_epoch,best_acc,))
 
-        print("best epoch {} valid precision: {}".format(best_epoch,best_acc,))
-        
-        model_bias_output, bias_logits = self.get_continue_prompt_bias(promptModel,continue_prompt,num_tokens,save_name,prompt_template)
+        model_bias_output, bias_logits, bias_vector = self.get_continue_prompt_bias(promptModel,continue_prompt,num_tokens,best_ckpt,prompt_template)
 
         results  = {}
         for dataset in ["lama","uni","lama_whu"]:
-            debias_output = self.evaluate(promptModel, test_dataloader[dataset], bias_logits=bias_logits,vocab_subset_indices=subset_indices,soft_tempalte_ckpt=save_name,continue_prompt=continue_prompt,num_tokens=num_tokens)
-            origin_output = self.evaluate(promptModel, test_dataloader[dataset], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=save_name,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            debias_output = self.evaluate(promptModel, test_dataloader[dataset], bias_logits=bias_logits, bias_vector=bias_vector, scaling_debiased_logit=True,vocab_subset_indices=subset_indices,soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            origin_output = self.evaluate(promptModel, test_dataloader[dataset], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            acc_, (probs_, preds_, labels_) = debias_output
+            debias_output = acc_, (probs_, sub_labels[dataset],preds_, labels_)
+            acc_, (probs_, preds_, labels_) = origin_output
+            origin_output = acc_, (probs_, sub_labels[dataset],preds_, labels_)
             results[dataset] = (debias_output,origin_output)
 
         return model_bias_output, results
@@ -1226,10 +1272,10 @@ class Experiment():
             bias_logits = decoder(mask_token_features[0]) / norm2
         model_bias_output = bias_logits * norm2
 
-        return model_bias_output, bias_logits
+        return model_bias_output, bias_logits, mask_token_features[0]
 
 
-    def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader,bias_logits=None, vocab_subset_indices=None,soft_tempalte_ckpt=None,continue_prompt="prefix",num_tokens=5):
+    def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader,bias_logits=None, bias_vector=None,scaling_debiased_logit=False, vocab_subset_indices=None,soft_tempalte_ckpt=None,continue_prompt="prefix",num_tokens=5):
         promptModel.eval()
 
         # 统一框架
@@ -1279,6 +1325,10 @@ class Experiment():
                         transformer_output = transformer_output[:,num_tokens:,:]
                     mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
                     mask_token_features = tranform_layer(mask_token_transformer_output)
+
+                    # linear层之后的特征向量, 论文理论框架中用于debias的向量
+                    prediction_vectors = mask_token_features
+
                     mask_token_logits = None
                     for i in range(mask_token_features.shape[0]):
                         norm2 = torch.norm(mask_token_features[i], p=2)
@@ -1289,16 +1339,28 @@ class Experiment():
                             mask_token_logits = torch.cat((mask_token_logits,temp),dim=0)
                     
                     mask_logits = mask_token_logits
+                    if vocab_subset_indices != None:
+                        mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
+                    # 对分布做debias
+                    mask_logits -= bias_logits
+
+                    # 计算出来一个缩放参数，用于讲debias后的logits缩放到合理的范围
+                    if scaling_debiased_logit:
+                        norm_bias = torch.norm(bias_vector,p=2)
+                        norm_preds = torch.norm(prediction_vectors,dim=-1)
+                        normalized_pred_vecs = (prediction_vectors.T/norm_preds).T
+                        normlaized_bias_vec = bias_vector/norm_bias
+                        debais_vecs = normalized_pred_vecs - normlaized_bias_vec
+                        norm_debias = torch.norm(debais_vecs,dim=-1)
+                        batch_scaling_vec = norm_preds/norm_debias
+                        mask_logits = (mask_logits.T*batch_scaling_vec).T
+
                 else:
                     logits = promptModel(inputs).logits
                     mask_logits = logits[torch.where(inputs['loss_ids']>0)]
-
-                if vocab_subset_indices != None:
-                    mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
+                    if vocab_subset_indices != None:
+                        mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
                 
-                # 对分布做debias
-                if bias_logits != None:
-                    mask_logits -= bias_logits
 
                 labels = inputs["label"]
                 alllabels += labels.cpu().tolist()
@@ -1393,12 +1455,62 @@ class Experiment():
 
 if __name__ == '__main__':
     exp = Experiment()
+    exp.clear_output()
+    avg_output = {}
+    datasets = ["LAMA","LAMA-WHU","WIKI-UNI"]
+    for model in ["bert-base-cased","bert-large-cased","roberta-large"]:
+
+        # 统计平均结果
+        for dataset in datasets:
+            outputs = []
+            for num in range(1,4):
+                exp.load_output(f"/home/jiao/code/prompt/OptiPrompt_bk/TruelyKnow/outputs/openprompt/continue_prompt/{model}/optiprompt_5/debias_answer_type_tokens/origin_embedding/exp_{num}/result.json")
+                outputs.append(list(exp.output_result.values())[0][dataset]["optiprompt_5"])
+            avg_P = []
+            avg_P_d = []
+            avg_KL  = []
+            avg_KL_d = []
+            for item in outputs:
+                avg_P.append(item['P'])
+                avg_P_d.append(item["P_d"])
+                avg_KL.append(item["KL"])
+                avg_KL_d.append(item["KL_d"])
+            avg_P = np.mean(avg_P)
+            avg_P_d = np.mean(avg_P_d)
+            avg_KL = np.mean(avg_KL)
+            avg_KL_d = np.mean(avg_KL_d)
+            output_bk = exp.output_result
+            exp.output_result = avg_output
+            exp.add_output_item(model,dataset,"optiprompt",(avg_P,avg_P_d,avg_KL,avg_KL_d))
+            exp.output_result = output_bk
+
+
+
+    exp.output_result = avg_output
+
+    exp.print_output()
+    exit()
+    exp.init_model("bert","bert-base-cased")
+    exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA",ctrl_code=[1,1,1])
+    exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5,evaluate_mode=True,repeat_times=1)
     # exp.continue_prompt("P19",continue_prompt="optiprompt")
     output_dir = exp.work_dir + "/outputs/openprompt/result_statistic"
     # exp.num_epochs = 10
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-    # exp.save_output(output_dir+"/bert/continue/bert_vocab_intersection_result.json")
+    # exp.load_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_new.json")
+    # exp.print_output()
+    # exp.load_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result_new.json")
+    # exp.print_output()
+    # exp.load_output(output_dir+"/roberta-large/robert_vocab_intersection_result_new.json")
+    # exp.print_output()
+    # tune_opti = "/home/jiao/code/prompt/OptiPrompt_bk/TruelyKnow/outputs/tune_opti"
+    # exp.load_output(tune_opti+"/output_bert_base_epoch_50_lr_3e-2_bert_commonvocab.json")
+    # exp.print_output()
+    # exp.load_output(tune_opti+"/output_bert_large_epoch_50_lr_3e-2_bert_commonvocab.json")
+    # exp.print_output()
+    # exp.load_output(tune_opti+"/output_roberta_large_epoch_50_lr_3e-2.json")
+    # exp.print_output()
+
 
     # exp.num_epochs = 10
     # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="prefix",num_tokens=5)
@@ -1410,20 +1522,22 @@ if __name__ == '__main__':
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-    # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result.json")
-    # exp.load_output("outputs/openprompt/result_statistic/roberta-large/roberta_vocab_intersection_result.json")
+    # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_new.json")
+    # # exp.load_output("outputs/openprompt/result_statistic/roberta-large/roberta_vocab_intersection_result.json")
     # exp.print_output()
     # exp.clear_output()
 
 
     # exp.init_model("bert","bert-large-cased")
-    # exp.init_common_vocab(self.work_dir + "/common_vocabs/common_vocab_cased.txt")
+    # exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-    # exp.save_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result.json")
+    # # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+    # exp.save_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result_new.json")
+    # exp.print_output()
     # exp.clear_output()
+    # # exp.clear_output()
 
     # exp.init_model("bert","nsadeq/InformBERT")
     # exp.init_common_vocab(self.work_dir + "/common_vocabs/common_vocab_cased.txt")
@@ -1434,20 +1548,20 @@ if __name__ == '__main__':
     # exp.save_output(output_dir+"/InformBert/bert_vocab_intersection_result.json")
     # exp.clear_output()
 
-    exp.init_model("roberta","roberta-large")
-    # exp.relations = ["P37"]
-    exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
-
-    # exp.raw_manual_prompt("P37",PLM="roberta-large",prompt="AutoPrompt")
+    # exp.init_model("roberta","roberta-large")
+    # exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",ctrl_code=[1,1,1])
-    exp.learning_rate = 6e-3
-    exp.num_epochs = 20
-    exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5, repeat_times=1, )
-    # exp.save_output(output_dir+"/roberta-large/roberta_vocab_intersection_result.json")
-    exp.print_output()
-    exp.clear_output()
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+    # exp.save_output(output_dir+"/roberta-large/robert_vocab_intersection_result_new.json")
+    # exp.print_output()
+    # exp.clear_output()
+    # exp.learning_rate = 6e-3
+    # exp.num_epochs = 20
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5, repeat_times=1, )
+    # # exp.save_output(output_dir+"/roberta-large/roberta_vocab_intersection_result.json")
+    # exp.print_output()
+    # exp.clear_output()
 
     # exp.init_model("roberta","roberta-large")
     # exp.init_common_vocab(self.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
