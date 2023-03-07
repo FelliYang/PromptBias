@@ -12,12 +12,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.parameter
+from datasets import load_dataset, load_from_disk
 from openprompt import (PromptDataLoader, PromptForClassification,
                         PromptForGeneration, PromptModel)
 from openprompt.data_utils import InputExample
 from openprompt.plms import load_plm
 from openprompt.prompt_base import Template
 from openprompt.prompts import ManualTemplate, MixedTemplate, SoftTemplate
+from openprompt.prompts import ManualVerbalizer
+from openprompt.data_utils.huggingface_dataset import YahooAnswersTopicsProcessor
+from openprompt.data_utils.data_sampler import FewShotSampler
 from torch.utils.data import WeightedRandomSampler
 from tqdm import tqdm
 from transformers import (AdamW, AutoModelForMaskedLM, AutoTokenizer,
@@ -36,6 +40,7 @@ from math import log
 from utils import set_seed
 from prettytable import PrettyTable
 import copy
+
 
 set_seed(7)
 
@@ -340,8 +345,9 @@ class Experiment():
         
 
         return final_output
+   
     
-    def get_template_bias_tensor(self, model,tokenizer, template):
+    def get_template_bias_tensor(self, model,tokenizer, template, y_mask_index='unk'):
         """
         返回某个manual template在model下的bais_logits，该logits已经归一化了, 将会用于debias
         template 的形式为 [MASK] xxx xxx xxx [MASK]
@@ -363,15 +369,21 @@ class Experiment():
         model_input = {key:value.to(model.device) for key,value in model_input.items()}
 
         transformer_output = transformer_blocks(**model_input)[0]
-         # 找到[MASK]的位置
-        y_mask_index = 0
-        mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-        input_token_ids = model_input["input_ids"][0].tolist()
-        for i,e in enumerate(reversed(input_token_ids)):
-            if e == mask_id:
-                y_mask_index = -(i+1) 
-                break
-        assert y_mask_index < 0
+        
+        if y_mask_index=='unk':
+            # 找到[MASK]的位置
+            y_mask_index = 0
+            mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+            input_token_ids = model_input["input_ids"][0].tolist()
+            for i,e in enumerate(reversed(input_token_ids)):
+                if e == mask_id:
+                    y_mask_index = -(i+1) 
+                    break
+            assert y_mask_index < 0
+        else:
+            # 已经传入了index的位置
+            y_mask_index = y_mask_index
+            
         transformer_output = transformer_output[0][y_mask_index]
 
         # 这个transform层的意义我不清楚，但是很重要，这才算是得到了特征向量
@@ -379,8 +391,70 @@ class Experiment():
         norm2 = torch.norm(bias_features)
         bias_logits = decoder(bias_features) / norm2
 
+        bias_features = bias_features.detach()
+        bias_logits = bias_logits.detach()
+
         return bias_logits, bias_features    
 
+
+    def get_template_bias_tensor_by_sample(self, promptModel:PromptModel, support_dataloader, num_tokens=5):
+        """
+        根据采样得到的数据，估计出bias tensor 和 bias logits
+        num_tokens 用于softtemplate
+        """
+        promptModel.eval()
+        # 统一框架
+        # 1. transformer block
+        # 2. transform layer
+        # 3. decoder
+        model = promptModel.plm
+        if isinstance(model, BertForMaskedLM):
+            transformer_blocks = model.bert
+            tranform_layer  = model.cls.predictions.transform
+            decoder = model.cls.predictions.decoder
+        elif isinstance(model, RobertaForMaskedLM):
+            transformer_blocks = model.roberta
+            tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
+            decoder = model.lm_head.decoder
+        
+        # 暂时只支持prompt for classfication
+        assert isinstance(promptModel, PromptForClassification)
+        all_prediction_vectors = None
+        for inputs in support_dataloader:
+            inputs = inputs.to(promptModel.device)
+            # 以下逻辑是把openprompt的forward抄了过来
+            batch = promptModel.template.process_batch(inputs)
+            input_batch = {key: batch[key] for key in batch if key in promptModel.prompt_model.forward_keys}
+            transformer_output = transformer_blocks(**input_batch)[0]
+            # 对于softtemplate，这里有一个后处理
+            if isinstance(promptModel.template, SoftTemplate):
+                # 去掉softembedding
+                transformer_output = transformer_output[:,num_tokens:,:]
+            mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
+            mask_token_features = tranform_layer(mask_token_transformer_output)
+            
+            # linear层之后的特征向量, 论文理论框架中用于debias的向量
+            if all_prediction_vectors==None:
+                all_prediction_vectors = mask_token_features
+            else:
+                all_prediction_vectors = torch.cat((all_prediction_vectors, mask_token_features), dim=0)
+            
+        # 求平均vector以及它的模长
+        avg_prediction_vector = torch.mean(all_prediction_vectors,dim=0)
+        avg_norm = torch.norm(avg_prediction_vector)
+        # avg_prediction_vector = avg_prediction_vector / avg_norm
+        
+        # 求平均logit值
+        avg_logits = torch.mean(decoder(all_prediction_vectors), dim=0)
+
+        # 对平均logit正则化
+        normalized_avg_logits = avg_logits / avg_norm
+
+        normalized_avg_logits = normalized_avg_logits.detach()
+        avg_prediction_vector = avg_prediction_vector.detach()
+
+        return normalized_avg_logits, avg_prediction_vector
+        
 
     def generate_image(self,before_debias_preds, after_debias_preds, labels, model_bias, save_path="test.png"):
         """
@@ -439,6 +513,199 @@ class Experiment():
         axs[2,1].scatter(acc_labels_x,acc_labels_y,cmap="Oranges",s=acc_labels_num*10)
         plt.savefig(save_path)
 
+
+    def general_continue_prompt(self, dataset, embedding_save_dir,num_tokens=5, continue_prompt="optiprompt", random_init="none", evaluate_mode=False,):
+        # 获取预训练模型
+        plm, tokenizer, model_config, WrapperClass = self.plm,self.tokenizer,self.model_config,self.WrapperClass
+
+        # 是否要对模型的weight随机初始化
+        if random_init=="all":
+            plm = AutoModelForMaskedLM.from_config(model_config)
+
+        # 构造prompt
+
+        current_template = '{"soft":None,"duplicate":' + str(num_tokens) + '}'
+        current_template += ' sentence1: {"placeholder":"text_a"} . sentence2: {"placeholder":"text_b"} . word: {"meta":"word"} {"mask"} .'
+        prompt_template = MixedTemplate(model=plm,tokenizer=tokenizer,text=current_template)
+            # prompt_template.soft_embedding.weight.data.normal_(mean=0.0, std=model_config.initializer_range)
+        
+        # 加载数据集
+        # max_tokens_len = self.compute_max_pad(dataset, WrapperClass, tokenizer, prompt_template)
+        max_tokens_len = 128
+        train_dataloader = PromptDataLoader(dataset=dataset["train"], template=prompt_template, tokenizer=tokenizer,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
+                batch_size=16)
+        
+        valid_dataloader = PromptDataLoader(dataset=dataset["validation"], template=prompt_template, tokenizer=tokenizer,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
+                batch_size=16)
+        test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=tokenizer,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
+                batch_size=16)
+        
+        # 定义verbalizer
+        myverbalizer = ManualVerbalizer(tokenizer, num_classes=2,
+                        label_words=[["False"], ["True"]])
+        # 准备prompt Model
+        promptModel = PromptForClassification(
+            template = prompt_template,
+            plm = plm,
+            verbalizer=myverbalizer,
+            freeze_plm=True,
+            
+        )
+
+        promptModel.cuda()
+
+        best_ckpt = os.path.join(embedding_save_dir, f"weight_save/model_full-prompt_random_init.ckpt")
+        if evaluate_mode==False:
+            # 开始训练
+            loss_func = torch.nn.CrossEntropyLoss()
+            no_decay = ['bias', 'LayerNorm.weight']
+
+            optimizer_grouped_parameters = [
+                {'params': [p for n,p in promptModel.template.named_parameters() if "raw_embedding" not in n]}
+            ]
+
+            optimizer = AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
+            t_total = len(dataset["train"]) * self.num_epochs
+            scheduler = get_cosine_schedule_with_warmup(optimizer, int(t_total * self.warmup_proportion), t_total)
+
+            time_start = time()
+            best_acc = 0
+            best_epoch = -1  
+            self.create_dir(best_ckpt)
+            for epoch in range(self.num_epochs):
+                promptModel.train()
+                tot_loss = 0
+                for step, inputs in enumerate(train_dataloader):
+                    inputs = inputs.cuda()
+                    logits = promptModel(inputs)
+                    # mask_logits = logits[torch.where(inputs['loss_ids']>0)]
+                    loss = loss_func(logits, inputs["label"])
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                    tot_loss += loss.item()
+                    # print(tot_loss/(step+1))
+                # validate it
+            
+                acc,_ =  self.evaluate(promptModel, valid_dataloader)
+                if acc > best_acc:
+                    # 保存最好的epoch
+                    best_epoch = epoch
+                    best_acc = acc
+                    if continue_prompt=="prefix":
+                        soft_embeds = promptModel.template.state_dict()["soft_embeds"].clone()
+                    elif continue_prompt=='optiprompt':
+                        soft_embeds = promptModel.template.state_dict()["soft_embedding.weight"].clone()
+                    torch.save(soft_embeds,best_ckpt)
+                    
+
+            print("best epoch {} valid precision: {}".format(best_epoch,best_acc,))
+            model_bias_output, bias_logits, bias_vector = self.get_continue_prompt_bias(promptModel,continue_prompt,num_tokens,best_ckpt,prompt_template)
+            debias_output = self.evaluate(promptModel, test_dataloader[dataset], bias_logits=bias_logits, bias_vector=bias_vector, scaling_debiased_logit=True,soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            origin_output = self.evaluate(promptModel, test_dataloader[dataset], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            return model_bias_output,(debias_output,origin_output)
+    
+
+    def test_wic(self):
+        # 加载wic数据集e
+        # wic = load_dataset("super_glue","wic",cache_dir="home/jiao/.cache/huggingface/datasets")
+        # wic.save_to_disk("/home/jiao/datasets/super_glue/wic")
+        wic = load_from_disk("/home/jiao/datasets/super_glue/wic")
+        dataset = {}
+        for split in ['train', 'validation', 'test']:
+            dataset[split] = []
+            for data in wic[split]:
+                input_example = InputExample(text_a = data['sentence1'], text_b = data['sentence2'], meta={"word":data["word"]},label=int(data['label']), guid=data['idx'])
+                dataset[split].append(input_example)
+        wic_output_dir = "/home/jiao/code/prompt/PromptBias/TruelyKnow/outputs/superglue/wic"
+        self.general_continue_prompt(dataset, wic_output_dir)
+
+
+    def calibrate(self, prompt_model: PromptForClassification, dataloader: PromptDataLoader) -> torch.Tensor:
+        r"""Calibrate. See `Paper <https://arxiv.org/abs/2108.02035>`_
+        
+        Args:
+            prompt_model (:obj:`PromptForClassification`): the PromptForClassification model.
+            dataloader (:obj:`List`): the dataloader to conduct the calibrate, could be a virtual one, i.e. contain an only-template example.
+        
+        Return:
+            (:obj:`torch.Tensor`) A tensor of shape  (vocabsize) or (mask_num, vocabsize), the logits calculated for each word in the vocabulary
+        """
+        all_logits = []
+        prompt_model.eval()
+        for batch in tqdm(dataloader,desc='ContextCali'):
+            batch = batch.to(prompt_model.device)
+            logits = prompt_model.forward_without_verbalize(batch)
+            all_logits.append(logits.detach())
+        all_logits = torch.cat(all_logits, dim=0)
+        return all_logits
+
+
+    def prior_on_yahoo(self):
+        # manual prompt  A {"mask"} news : {"placeholder": "text_a"} {"placeholder": "text_b"}
+        # manual verblizer one to one
+        """
+        先导试验：对比vector debiasing 和 calibration 谁的debias效果好
+        """
+        # 准备好数据集
+        dataset = {}
+        raw_dataset = load_from_disk("/home/jiao/code/prompt/PromptBias/TruelyKnow/OpenPrompt/datasets/TextClassification/yahoo_answers_topics")
+        dataset["train"] = list(map(YahooAnswersTopicsProcessor().transform,raw_dataset["train"]))
+        dataset["test"] = list(map(YahooAnswersTopicsProcessor().transform,raw_dataset["test"]))[:100]
+        class_labels = YahooAnswersTopicsProcessor().get_labels()
+
+        # 假设数据已经梳理好了
+        manual_tempalte = '[ Category : {"mask"} ] {"placeholder": "text_a"} {"placeholder": "text_b"}'
+        prompt_template = ManualTemplate(tokenizer=self.tokenizer, text=manual_tempalte)
+
+        # 定义prompt_pnly_tempalte用于计算bias
+        # prompt_only_tempalte = 'A {"mask"} news : '+ '{} {}'.format(self.tokenizer.mask_token, self.tokenizer.mask_token)
+        prompt_only_tempalte = '[ Category : {} ] {} {}'.format(self.tokenizer.mask_token, self.tokenizer.mask_token,self.tokenizer.mask_token)
+        bias_logits, bias_vector = self.get_template_bias_tensor(self.plm,self.tokenizer,template=prompt_only_tempalte,y_mask_index=4)
+
+        # 定义verbalizer
+        myverbalizer = ManualVerbalizer(self.tokenizer, classes=class_labels).from_file("/home/jiao/code/prompt/PromptBias/TruelyKnow/OpenPrompt/scripts/TextClassification/yahoo_answers_topics/manual_verbalizer.json")
+        # 计算得到正常精度和debias精度
+        test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=self.tokenizer,
+            tokenizer_wrapper_class=self.WrapperClass, max_seq_length=128, decoder_max_length=3,
+            batch_size=32,shuffle=False,teacher_forcing=False, predict_eos_token=False,
+            truncate_method="tail")
+        
+        # 准备model
+        prompt_model = PromptForClassification(plm=self.plm,template=prompt_template, verbalizer=myverbalizer, freeze_plm=True,plm_eval_mode=True)
+        prompt_model=  prompt_model.cuda()
+
+         # 开始预测
+        
+        # 采用prompt-only input来估计先验分布
+        cc_logits = torch.norm(bias_vector)*bias_logits
+        cc_logits = cc_logits.to(prompt_model.device)
+        acc_calibration_v1, _ = self.evaluate(prompt_model,test_dataloader,calibration=True, calib_logits=cc_logits)
+
+        # 采用采样来估计先验分布
+        from openprompt.data_utils.data_sampler import FewShotSampler
+        support_sampler = FewShotSampler(num_examples_total=200, also_sample_dev=False)
+        dataset['support'] = support_sampler(dataset['train'], seed=7)
+        for example in dataset['support']:
+            example.label = -1 # remove the labels of support set for clarification
+        support_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=self.tokenizer,
+            tokenizer_wrapper_class=self.WrapperClass, max_seq_length=128, decoder_max_length=3,
+            batch_size=32,shuffle=False, teacher_forcing=False, predict_eos_token=False,
+            truncate_method="tail")
+        cc_logits = self.calibrate(prompt_model, support_dataloader).mean(dim=0)
+        acc_calibration_v2, _ = self.evaluate(prompt_model,test_dataloader,calibration=True, calib_logits=cc_logits)
+        
+        acc_raw, (probs, allpreds, alllabels) = self.evaluate(prompt_model,test_dataloader, vocab_subset_indices=None)
+        acc_debias,(probs, allpreds, alllabels) = self.evaluate(prompt_model,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector,scaling_debiased_logit=True, vocab_subset_indices=None)
+
+        print("原始精度 {} debias精度 {} 校验精度v1{}  校验精度v1{}".format(acc_raw, acc_debias, acc_calibration_v1, acc_calibration_v2))
+            # acc_raw,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
+        
 
     def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None, bias_tensor=None, embeddings_renormalize=False, prompt="LAMA" ):
         """
@@ -1275,7 +1542,13 @@ class Experiment():
         return model_bias_output, bias_logits, mask_token_features[0]
 
 
-    def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader,bias_logits=None, bias_vector=None,scaling_debiased_logit=False, vocab_subset_indices=None,soft_tempalte_ckpt=None,continue_prompt="prefix",num_tokens=5):
+    def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader,
+                bias_logits=None, bias_vector=None, 
+                scaling_debiased_logit=False, 
+                vocab_subset_indices=None,
+                soft_tempalte_ckpt=None, 
+                continue_prompt="prefix",num_tokens=5,
+                calibration=False, calib_logits=None):
         promptModel.eval()
 
         # 统一框架
@@ -1303,46 +1576,86 @@ class Experiment():
         alllabels = []
         probs = None
 
+        if bias_logits!=None:
+            bias_logits = bias_logits.to(promptModel.plm.device)
+            bias_vector = bias_vector.to(promptModel.plm.device)
+
         if vocab_subset_indices != None:
             vocab_subset_indices = vocab_subset_indices.to(promptModel.plm.device)
             if bias_logits!=None:
-                bias_logits = bias_logits.to(promptModel.plm.device)
                 bias_logits = bias_logits.index_select(index=vocab_subset_indices,dim=0)
+
+        # calibration 需要对verbalizer操作一下
+        if calibration:
+            if isinstance(promptModel, PromptForClassification):
+                promptModel.verbalizer.register_calibrate_logits(calib_logits)
 
         for step, inputs in enumerate(data_loader):
             inputs =  inputs.cuda()
             with torch.no_grad():
                 if bias_logits!=None:
-                    
-                    # 以下逻辑是把openprompt的forward抄了过来
-                    batch = promptModel.template.process_batch(inputs)
-                    input_batch = {key: batch[key] for key in batch if key in promptModel.forward_keys}
-                    transformer_output = transformer_blocks(**input_batch)[0]
-                    #FIXME 添加后处理
-                    # 对于softtemplate，这里有一个后处理
-                    if isinstance(promptModel.template,SoftTemplate):
-                        # 去掉softembedding
-                        transformer_output = transformer_output[:,num_tokens:,:]
-                    mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
-                    mask_token_features = tranform_layer(mask_token_transformer_output)
+                    if isinstance(promptModel, PromptForClassification):
+                        # promptModel(inputs)
+                        # 以下逻辑是把openprompt的forward抄了过来
+                        batch = promptModel.template.process_batch(inputs)
+                        input_batch = {key: batch[key] for key in batch if key in promptModel.prompt_model.forward_keys}
+                        transformer_output = transformer_blocks(**input_batch)[0]
+                        # 对于softtemplate，这里有一个后处理
+                        if isinstance(promptModel.template,SoftTemplate):
+                            # 去掉softembedding
+                            transformer_output = transformer_output[:,num_tokens:,:]
+                        mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
+                        mask_token_features = tranform_layer(mask_token_transformer_output)
 
-                    # linear层之后的特征向量, 论文理论框架中用于debias的向量
-                    prediction_vectors = mask_token_features
+                        # linear层之后的特征向量, 论文理论框架中用于debias的向量
+                        prediction_vectors = mask_token_features
+                        mask_token_logits = None
+                        for i in range(mask_token_features.shape[0]):
+                            norm2 = torch.norm(mask_token_features[i], p=2)
+                            temp = decoder(mask_token_features[i]).unsqueeze(dim=0) / norm2
+                            if mask_token_logits == None:
+                                mask_token_logits = temp
+                            else:
+                                mask_token_logits = torch.cat((mask_token_logits,temp),dim=0)
+                        
+                        mask_logits = mask_token_logits
 
-                    mask_token_logits = None
-                    for i in range(mask_token_features.shape[0]):
-                        norm2 = torch.norm(mask_token_features[i], p=2)
-                        temp = decoder(mask_token_features[i]).unsqueeze(dim=0) / norm2
-                        if mask_token_logits == None:
-                            mask_token_logits = temp
-                        else:
-                            mask_token_logits = torch.cat((mask_token_logits,temp),dim=0)
-                    
-                    mask_logits = mask_token_logits
-                    if vocab_subset_indices != None:
-                        mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
-                    # 对分布做debias
-                    mask_logits -= bias_logits
+                         # 对分布做debias
+                        mask_logits -= bias_logits
+                        
+                        # 从forward逻辑中中抄过来的
+                        mask_logits =  promptModel.verbalizer.process_outputs(mask_logits, batch=inputs)
+                       
+
+                    elif isinstance(promptModel, PromptModel):
+                        # 以下逻辑是把openprompt的forward抄了过来
+                        batch = promptModel.template.process_batch(inputs)                                                                                                               
+                        input_batch = {key: batch[key] for key in batch if key in promptModel.forward_keys}
+                        transformer_output = transformer_blocks(**input_batch)[0]
+                        # 对于softtemplate，这里有一个后处理
+                        if isinstance(promptModel.template,SoftTemplate):
+                            # 去掉softembedding
+                            transformer_output = transformer_output[:,num_tokens:,:]
+                        mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
+                        mask_token_features = tranform_layer(mask_token_transformer_output)
+
+                        # linear层之后的特征向量, 论文理论框架中用于debias的向量
+                        prediction_vectors = mask_token_features
+
+                        mask_token_logits = None
+                        for i in range(mask_token_features.shape[0]):
+                            norm2 = torch.norm(mask_token_features[i], p=2)
+                            temp = decoder(mask_token_features[i]).unsqueeze(dim=0) / norm2
+                            if mask_token_logits == None:
+                                mask_token_logits = temp
+                            else:
+                                mask_token_logits = torch.cat((mask_token_logits,temp),dim=0)
+                        
+                        mask_logits = mask_token_logits
+                        if vocab_subset_indices != None:
+                            mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
+                        # 对分布做debias
+                        mask_logits -= bias_logits
 
                     # 计算出来一个缩放参数，用于讲debias后的logits缩放到合理的范围
                     if scaling_debiased_logit:
@@ -1356,8 +1669,14 @@ class Experiment():
                         mask_logits = (mask_logits.T*batch_scaling_vec).T
 
                 else:
-                    logits = promptModel(inputs).logits
-                    mask_logits = logits[torch.where(inputs['loss_ids']>0)]
+                    if isinstance(promptModel, PromptForClassification):
+                        mask_logits = promptModel(inputs)
+                        # # 执行verbalizer
+                        # mask_logits =  promptModel.verbalizer.process_outputs(mask_logits, batch=inputs)
+
+                    else:
+                        logits = promptModel(inputs).logits
+                        mask_logits = logits[torch.where(inputs['loss_ids']>0)]
                     if vocab_subset_indices != None:
                         mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
                 
@@ -1378,9 +1697,16 @@ class Experiment():
                 allpreds.extend(predict_index.cpu().tolist())
         
         acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
-        
-        print(acc,flush=True)
-        # 对于vocab_subset的场景，allpreds和alllabels均是原始词表中的索引
+       
+
+        # calibration 副作用需要手动
+        if calibration:
+            promptModel.verbalizer._calibrate_logits = None
+            # uncalib_logits = torch.ones_like(calib_logits).to(calib_logits.device)
+            # if isinstance(promptModel, PromptForClassification):
+            #     promptModel.verbalizer.register_calibrate_logits(uncalib_logits)
+
+         # 对于vocab_subset的场景，allpreds和alllabels均是原始词表中的索引
         return acc, (probs, allpreds, alllabels)
 
     """
@@ -1455,78 +1781,9 @@ class Experiment():
 
 if __name__ == '__main__':
     exp = Experiment()
-    exp.clear_output()
-    avg_output = {}
-    datasets = ["LAMA","LAMA-WHU","WIKI-UNI"]
-    for model in ["bert-base-cased","bert-large-cased","roberta-large"]:
-
-        # 统计平均结果
-        for dataset in datasets:
-            outputs = []
-            for num in range(1,4):
-                exp.load_output(f"/home/jiao/code/prompt/OptiPrompt_bk/TruelyKnow/outputs/openprompt/continue_prompt/{model}/optiprompt_5/debias_answer_type_tokens/origin_embedding/exp_{num}/result.json")
-                outputs.append(list(exp.output_result.values())[0][dataset]["optiprompt_5"])
-            avg_P = []
-            avg_P_d = []
-            avg_KL  = []
-            avg_KL_d = []
-            for item in outputs:
-                avg_P.append(item['P'])
-                avg_P_d.append(item["P_d"])
-                avg_KL.append(item["KL"])
-                avg_KL_d.append(item["KL_d"])
-            avg_P = np.mean(avg_P)
-            avg_P_d = np.mean(avg_P_d)
-            avg_KL = np.mean(avg_KL)
-            avg_KL_d = np.mean(avg_KL_d)
-            output_bk = exp.output_result
-            exp.output_result = avg_output
-            exp.add_output_item(model,dataset,"optiprompt",(avg_P,avg_P_d,avg_KL,avg_KL_d))
-            exp.output_result = output_bk
-
-
-
-    exp.output_result = avg_output
-
-    exp.print_output()
-    exit()
-    exp.init_model("bert","bert-base-cased")
-    exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA",ctrl_code=[1,1,1])
-    exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5,evaluate_mode=True,repeat_times=1)
-    # exp.continue_prompt("P19",continue_prompt="optiprompt")
-    output_dir = exp.work_dir + "/outputs/openprompt/result_statistic"
-    # exp.num_epochs = 10
-    # exp.load_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_new.json")
-    # exp.print_output()
-    # exp.load_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result_new.json")
-    # exp.print_output()
-    # exp.load_output(output_dir+"/roberta-large/robert_vocab_intersection_result_new.json")
-    # exp.print_output()
-    # tune_opti = "/home/jiao/code/prompt/OptiPrompt_bk/TruelyKnow/outputs/tune_opti"
-    # exp.load_output(tune_opti+"/output_bert_base_epoch_50_lr_3e-2_bert_commonvocab.json")
-    # exp.print_output()
-    # exp.load_output(tune_opti+"/output_bert_large_epoch_50_lr_3e-2_bert_commonvocab.json")
-    # exp.print_output()
-    # exp.load_output(tune_opti+"/output_roberta_large_epoch_50_lr_3e-2.json")
-    # exp.print_output()
-
-
-    # exp.num_epochs = 10
-    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="prefix",num_tokens=5)
-    # exp.save_output(output_dir+"/bert/continue/perfix_5/bert_vocab_intersection_result.json")
-    # # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt",embeddings_renormalize=True)
-    # exp.init_model("bert","bert-base-cased")
-    # exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
-    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-    # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_new.json")
-    # # exp.load_output("outputs/openprompt/result_statistic/roberta-large/roberta_vocab_intersection_result.json")
-    # exp.print_output()
-    # exp.clear_output()
-
+    exp.init_model("bert","bert-large-cased")
+    exp.prior_on_yahoo()
+    
 
     # exp.init_model("bert","bert-large-cased")
     # exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
