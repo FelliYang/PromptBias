@@ -7,7 +7,7 @@ from tqdm import tqdm
 from openprompt.data_utils.text_classification_dataset import AgnewsProcessor, DBpediaProcessor, ImdbProcessor, AmazonProcessor
 from openprompt.data_utils.huggingface_dataset import YahooAnswersTopicsProcessor
 import torch
-from openprompt.data_utils.utils import InputExample
+from openprompt.data_utils.utils import InputExample, InputFeatures
 import argparse
 import numpy as np
 import wandb
@@ -24,7 +24,39 @@ from sklearn.model_selection import train_test_split
 
 from openprompt.data_utils import FewShotSampler
 from transformers import BertForMaskedLM, RobertaForMaskedLM
+import os
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+parser = argparse.ArgumentParser("")
+
+parser.add_argument("--seed", type=int, default=144)
+parser.add_argument("--plm_eval_mode", action="store_true")
+parser.add_argument("--model", type=str, default='roberta')
+parser.add_argument("--model_name_or_path", default='/workspace/data/users/vega/checkpoints/huggingface_model/roberta-large')
+parser.add_argument("--openprompt_path", type=str, default="/workspace/data/users/xuziyang/code/PromptBias/TruelyKnow/OpenPrompt")
+parser.add_argument("--dataset",type=str)
+parser.add_argument("--sample_num",type=int, default=200)
+
+
+parser.add_argument("--num_epochs",type=int, default=10)
+parser.add_argument("--learning_rate",type=float, default=3e-2)
+parser.add_argument("--warmup_proportion",type=float, default=0)
+parser.add_argument("--shot", type=int, default=32)
+parser.add_argument("--debias_educated", type=float, default=True)
+parser.add_argument("--educated_by_sample", type=bool, default=True)
+
+parser.add_argument("--debug_mode", type=bool, default=False)
+
+args = parser.parse_args()
+
+set_seed(args.seed)
+
+from truely_know import Experiment
+exp = Experiment()
+exp.init_model(args.model, args.model_name_or_path)
+
+# FIXME: 修复soft template情况下的mask 位置不正确问题
 def find_mask_id(exp, content_free_template):
     t1 = content_free_template.replace("<input>", exp.tokenizer.unk_token)
     t2 = content_free_template.replace("<input>", exp.tokenizer.mask_token)
@@ -40,38 +72,47 @@ def find_mask_id(exp, content_free_template):
     
     return mask_id[0].item()
 
+def get_debias_vector():
+    """
+    获取prompt-only表征向量,用于debias
+    支持采样模式和mask模式来估计
+    """
+    if args.educated_by_sample:
+        bias_logits, bias_vector = exp.get_template_bias_tensor_by_sample(prompt_model, support_dataloader, evaluteMode=False)
+    else:
+        # 使用mask直接debias
+        # mask_id = find_mask_id(exp, templateOnly)
+        mask_id = 6
+        # 使用另一个Template构造出合适的tokenized_example
+        prompt_only_txt = templateOnly.replace("<input>", exp.tokenizer.mask_token)
+        prompt_only_template =  MixedTemplate(
+                model=exp.plm, tokenizer=exp.tokenizer, text = prompt_only_txt
+            )
+        
+        prompt_only_input = InputExample(text_a=exp.tokenizer.mask_token, text_b='', label=-1, guid=0)
+        wrapped_example = prompt_only_template.wrap_one_example(prompt_only_input)
+        wrapped_tokenizer = exp.WrapperClass(max_seq_length=max_seq_l, decoder_max_length=3, tokenizer=exp.tokenizer, truncate_method="tail")
+        tokenized_example = wrapped_tokenizer.tokenize_one_example(wrapped_example, teacher_forcing=False)
+        input_features = InputFeatures(**tokenized_example, **wrapped_example[1]).to_tensor()
+        input_features.cuda()
+        # 使用用来训练的mytemplate得到合适的embedding
+        batch = mytemplate.process_batch(input_features)
+        input_batch = {key: batch[key] for key in batch if key in prompt_model.prompt_model.forward_keys}
+        # 添加一个batch维度
+        input_batch = {key: torch.unsqueeze(input_batch[key], dim=0) for key in input_batch}
+        # 使用该batch来得到bias向量
+        bias_logits, bias_vector = exp.get_template_bias_tensor(exp.plm, exp.tokenizer,template="soft mask", template_embeddings=input_batch, y_mask_index=mask_id)
 
-parser = argparse.ArgumentParser("")
-
-parser.add_argument("--seed", type=int, default=144)
-parser.add_argument("--plm_eval_mode", action="store_true")
-parser.add_argument("--model", type=str, default='roberta')
-parser.add_argument("--model_name_or_path", default='/workspace/data/users/vega/checkpoints/huggingface_model/roberta-large')
-parser.add_argument("--openprompt_path", type=str, default="/workspace/data/users/xuziyang/code/PromptBias/TruelyKnow/OpenPrompt")
-parser.add_argument("--dataset",type=str)
-parser.add_argument("--sample_num",type=int, default=200)
+    return bias_logits, bias_vector
 
 
-parser.add_argument("--num_epochs",type=int, default=10)
-parser.add_argument("--learning_rate",type=float, default=0.03)
-parser.add_argument("--warmup_proportion",type=float, default=0)
-parser.add_argument("--shot", type=int, default=32)
-parser.add_argument("--debias_educated", type=float, default=False)
-parser.add_argument("--educated_by_sample", type=bool, default=False)
-
-args = parser.parse_args()
-
-set_seed(args.seed)
-
-from truely_know import Experiment
-exp = Experiment()
-exp.init_model(args.model, args.model_name_or_path)
 
 dataset = {}
 
 
 import os
 
+# 加载数据集
 if args.dataset == "yahoo":
     raw_dataset = load_from_disk(f"{args.openprompt_path}/datasets/TextClassification/yahoo_answers_topics")
     
@@ -110,13 +151,13 @@ if args.dataset == "yahoo":
         dataset['support'] = support_sampler(train_dataset, seed=args.seed)
         for example in dataset['support']:
             example.label = -1 # remove the labels of support set for clarification
-        torch.save(dataset["support"], "support.pt")
-        
+        torch.save(dataset["support"], "support.pt")     
 else:
     raise NotImplementedError
 
+if args.debug_mode:
+    dataset["test"] = dataset["test"][:100]
 
-dataset["test"] = dataset["test"]
 
 # 定义一个optiprompt的连续模板，暂时只用于yahoo
 templateTxt = '{"placeholder": "text_a"} {"placeholder": "text_b"} {"soft":"This topic is about"} {"mask"} .'
@@ -146,7 +187,7 @@ test_dataloader = PromptDataLoader(dataset=dataset["test"], template=mytemplate,
 
 support_dataloader = PromptDataLoader(dataset=dataset["support"], template=mytemplate, tokenizer=exp.tokenizer,
     tokenizer_wrapper_class=exp.WrapperClass, max_seq_length=max_seq_l, decoder_max_length=3,
-    batch_size=batch_s,shuffle=False, teacher_forcing=False, predict_eos_token=False,
+    batch_size=200,shuffle=False, teacher_forcing=False, predict_eos_token=False,
     truncate_method="tail")
 
 
@@ -161,20 +202,6 @@ prompt_model=  prompt_model.cuda()
 print("数据集划分 train {} valid {} test {}".format(
     len(dataset["train"]),len(dataset["valid"]),len(dataset["test"])))
 
-
-def get_debias_vector():
-    if args.educated_by_sample:
-        bias_logits, bias_vector = exp.get_template_bias_tensor_by_sample(prompt_model, support_dataloader, evaluteMode=False)
-    else:
-        # 使用mask直接debias
-        mask_id = find_mask_id(exp, templateOnly)
-        content_free_template = templateOnly.replace("<input>", exp.tokenizer.mask_token).replace('{"mask"}', exp.tokenizer.mask_token)
-        print("content_free_template: ***{}***".format(content_free_template))
-        assert '{' not in content_free_template
-        bias_logits, bias_vector = exp.get_template_bias_tensor(exp.plm, exp.tokenizer,template=content_free_template, y_mask_index=mask_id)
-        
-    return bias_logits, bias_vector
-
 import os
 embedding_save_dir = "/workspace/data/users/xuziyang/code/PromptBias/TruelyKnow/outputs/promptbias"
 best_ckpt = os.path.join(embedding_save_dir, f"weight_save/model_full-prompt_random_init.ckpt")
@@ -185,7 +212,6 @@ no_decay = ['bias', 'LayerNorm.weight']
 optimizer_grouped_parameters = [
     {'params': [p for n,p in prompt_model.template.named_parameters() if "raw_embedding" not in n]}
 ]
-
 
 optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 t_total = len(train_dataloader) * args.num_epochs
@@ -295,12 +321,25 @@ for epoch in range(args.num_epochs):
         
 pbar.close()
 print("best epoch {} valid precision: {}".format(best_epoch,best_acc,))
+
+
+# evalute
+prompt_model.eval()
 if args.debias_educated:
-    with torch.no_grad():
-        bias_logits, bias_vector =  get_debias_vector() 
+    soft_embeds = torch.load(best_ckpt)
+    prompt_model.template.soft_embedding.weight.data.copy_(soft_embeds)
+    bias_logits, bias_vector =  get_debias_vector() 
     acc,_ =  exp.evaluate(prompt_model, test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector)
+    print("test debias acc {:.3f}".format(acc))
 else:
-    acc,_ =  exp.evaluate(prompt_model, test_dataloader)
-print(f"测试集acc { acc}")
+    # 加载最佳权重
+    soft_embeds = torch.load(best_ckpt)
+    prompt_model.template.soft_embedding.weight.data.copy_(soft_embeds)
+    acc_valid,_ =  exp.evaluate(prompt_model, valid_dataloader)
+    acc,_ = exp.evaluate(prompt_model, test_dataloader) 
+    bias_logits, bias_vector =  get_debias_vector() 
+    # acc_debias,_ =  exp.evaluate(prompt_model, test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector)
+    acc_debias,_ =  exp.evaluate(prompt_model, test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector)
+    print("valid acc: {:.3f} test acc: orignal {:.3f} debias {:.3f}".format(acc_valid, acc, acc_debias))
 
 

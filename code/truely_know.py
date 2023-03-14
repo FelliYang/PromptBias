@@ -347,7 +347,7 @@ class Experiment():
         return final_output
    
     
-    def get_template_bias_tensor(self, model,tokenizer, template, y_mask_index='unk'):
+    def get_template_bias_tensor(self, model,tokenizer, template, template_embeddings=None, y_mask_index='unk'):
         """
         返回某个manual template在model下的bais_logits，该logits已经归一化了, 将会用于debias
         template 的形式为 [MASK] xxx xxx xxx [MASK]
@@ -364,9 +364,13 @@ class Experiment():
             transformer_blocks = model.roberta
             tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
             decoder = model.lm_head.decoder
-        
-        model_input = tokenizer(template,return_tensors="pt")
-        model_input = {key:value.to(model.device) for key,value in model_input.items()}
+        if template!="soft mask":
+            model_input = tokenizer(template,return_tensors="pt")
+            model_input = {key:value.to(model.device) for key,value in model_input.items()}
+        else:
+            # 使用自己tokenize好的input
+            model_input = template_embeddings
+            model_input = {key:value.to(model.device) for key,value in model_input.items()}
 
         transformer_output = transformer_blocks(**model_input)[0]
         
@@ -397,12 +401,13 @@ class Experiment():
         return bias_logits, bias_features    
 
 
-    def get_template_bias_tensor_by_sample(self, promptModel:PromptModel, support_dataloader, num_tokens=5):
+    def get_template_bias_tensor_by_sample(self, promptModel:PromptModel, support_dataloader, evaluteMode=True, num_tokens=5):
         """
         根据采样得到的数据，估计出bias tensor 和 bias logits
         num_tokens 用于softtemplate
         """
-        promptModel.eval()
+        if evaluteMode==True:
+            promptModel.eval()
         # 统一框架
         # 1. transformer block
         # 2. transform layer
@@ -416,6 +421,10 @@ class Experiment():
             transformer_blocks = model.roberta
             tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
             decoder = model.lm_head.decoder
+        
+        # 对transformer_block使用两个gpu并行避免显存爆炸问题
+        if not isinstance(transformer_blocks, torch.nn.DataParallel):
+            transformer_blocks  = torch.nn.DataParallel(transformer_blocks)
         
         # 暂时只支持prompt for classfication
         assert isinstance(promptModel, PromptForClassification)
@@ -441,7 +450,8 @@ class Experiment():
             
         # 求平均vector以及它的模长
         avg_prediction_vector = torch.mean(all_prediction_vectors,dim=0)
-        avg_norm = torch.norm(avg_prediction_vector)
+
+        avg_norm = torch.norm(avg_prediction_vector).item()
         # avg_prediction_vector = avg_prediction_vector / avg_norm
         
         # 求平均logit值
@@ -450,8 +460,9 @@ class Experiment():
         # 对平均logit正则化
         normalized_avg_logits = avg_logits / avg_norm
 
-        normalized_avg_logits = normalized_avg_logits.detach()
-        avg_prediction_vector = avg_prediction_vector.detach()
+        if evaluteMode==True:
+            normalized_avg_logits = normalized_avg_logits.detach()
+            avg_prediction_vector = avg_prediction_vector.detach()
 
         return normalized_avg_logits, avg_prediction_vector
         
