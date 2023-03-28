@@ -63,6 +63,7 @@ class Experiment():
         self.auto_prompt_dir = self.work_dir + "/data/autoprompt_data"
         self.lama_whu_data_dir = self.work_dir + "/data/LAMA-TREx_UHN"
         self.wiki_uni_data_dir = self.work_dir + "/data/wiki_uni"
+        self.templama_data_dir = self.work_dir + "/data/TEMPLAMA"
         self.common_vocab_path = self.work_dir + "/common_vocabs/common_vocab_cased.txt"
         self.lama_template_path = self.work_dir + "/relation_metainfo/LAMA_relations.jsonl"
         self.LPAQA_template_path = self.work_dir + "/relation_metainfo/LPAQA_relations.jsonl"
@@ -247,7 +248,7 @@ class Experiment():
         return indices
 
 
-    def get_answer_entity_indices(self, relation,tokenizer:PreTrainedTokenizer, include_uni_labels=True, common_vocab_intersection=True):
+    def get_answer_entity_indices(self, relation,tokenizer:PreTrainedTokenizer, include_uni_labels=True, include_templama_labels=False, common_vocab_intersection=True):
         """这个函数用来得到lama对应的answer空间，例如P的answer空间是cities"""
         entity_path = self.work_dir + "/data/entity.json"
         entity_data = load_json(entity_path)[relation]
@@ -275,6 +276,13 @@ class Experiment():
             uni_data = load_json(uni_path)
             uni_labels = [ item["obj_label"] for item in uni_data]
             entity_data += uni_labels
+        
+        if include_templama_labels:
+            templama_path = os.path.join(self.templama_data_dir,f"{relation}.jsonl")
+            templama_data = load_jsonl(templama_path)
+            templama_labels = [item["answer"][0]["name"] for item in templama_data]
+            entity_data += templama_labels
+
 
         # 对候选词表做一次common vocab的交叉
         if common_vocab_intersection:
@@ -312,27 +320,29 @@ class Experiment():
         prompt_only形式为 "[MASK] was born in [MASK] ." 这种形式
         映入vocab_subset_indices 来对齐lama在logits上的过滤
         """
-        model_input = tokenizer(prompt_only,return_tensors="pt")
-        mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-        input_token_ids = model_input["input_ids"][0].tolist()
-        # 从处理好的输入ids中找出来最后一个mask_id
-        y_mask_index = 0
-        for i,e in enumerate(reversed(input_token_ids)):
-            if e == mask_id:
-                y_mask_index = -(i+1) 
-                break
-        assert y_mask_index < 0
-        with torch.no_grad():
-            model_input = {k:v.to(model.device) for k,v in model_input.items()}
-            model_output = model(**model_input).logits
-            distribution = model_output[0][y_mask_index].cpu()
-            if vocab_subset_indices != None:
-                distribution = distribution.index_select(dim=0,index=vocab_subset_indices)
-            if not return_logits:
-                final_output = torch.softmax(distribution,0)
-            else:
-                final_output = distribution
+        if not isinstance(prompt_only,list):
+            model_input = tokenizer(prompt_only,return_tensors="pt")
+            mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+            input_token_ids = model_input["input_ids"][0].tolist()
+            # 从处理好的输入ids中找出来最后一个mask_id
+            y_mask_index = 0
+            for i,e in enumerate(reversed(input_token_ids)):
+                if e == mask_id:
+                    y_mask_index = -(i+1) 
+                    break
+            assert y_mask_index < 0
+            with torch.no_grad():
+                model_input = {k:v.to(model.device) for k,v in model_input.items()}
+                model_output = model(**model_input).logits
+                distribution = model_output[0][y_mask_index].cpu()
+                if vocab_subset_indices != None:
+                    distribution = distribution.index_select(dim=0,index=vocab_subset_indices)
+                if not return_logits:
+                    final_output = torch.softmax(distribution,0)
+                else:
+                    final_output = distribution
         
+
         if save_path!=None:
             probs = final_output.tolist()
             index = list(range(len(probs)))
@@ -842,6 +852,122 @@ class Experiment():
 
         return round(acc,5), (probs, sub_labels, allpreds, alllabels)
 
+    def manual_prompt_for_templama(self, relation,debias=False, vocab_subset_filter=True, vocab_subset="common_vocab"):
+        """
+        针对templama这个时间fact knowledge的专用数据集, 直接评估debias前后的性能
+        """
+        # 获取预训练模型
+        plm = self.plm
+        tokenizer = self.tokenizer
+        model_config = self.model_config
+        WrapperClass = self.WrapperClass
+        model = plm
+        model.eval()
+
+        # 根据当前模型，构造出来subset indices
+        if vocab_subset_filter:
+            if vocab_subset=="common_vocab":
+                vocab_subset_indices = self.get_common_vocab_indices(tokenizer)
+            elif vocab_subset=="answer_type_tokens":
+                vocab_subset_indices = self.get_answer_entity_indices(relation, tokenizer, include_templama_labels=True)
+            else:
+                raise ValueError(f"参数值{vocab_subset}不符合要求")
+        else:
+            vocab_subset_indices = None
+
+        # 构造数据集        
+        dataset = load_jsonl(os.path.join(self.templama_data_dir,f"{relation}.jsonl"))
+        
+        # 直接原始方式evaluate 
+        # 统一框架
+        # 1. transformer block
+        # 2. transform layer
+        # 3. decoder
+        if isinstance(model, BertForMaskedLM):
+            transformer_blocks = model.bert
+            tranform_layer  = model.cls.predictions.transform
+            decoder = model.cls.predictions.decoder
+        elif isinstance(model, RobertaForMaskedLM):
+            transformer_blocks = model.roberta
+            tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
+            decoder = model.lm_head.decoder
+        
+        allpreds = []
+        alllabels = []
+        allsubjs = []
+        probs = None
+
+        model.cuda()
+
+        for data in tqdm(dataset):
+            raw_template = "In [year], [X] holds the position of [Y]."
+            t1 = data["query"].find("holds")
+            subject = data["query"][0:t1-1]
+            allsubjs.append(subject)
+            prompt_based_input = data["query"].replace("_X_","[MASK] in {}".format(data["date"]))
+            prompt_only_input = raw_template.replace("[X]",tokenizer.mask_token).replace("[Y]",tokenizer.mask_token).replace("[year]",data["date"])
+            # print(prompt_based_input) # for debug
+            # print(prompt_only_input) # for debug
+            label = data["answer"][0]["name"]
+            label = tokenizer.convert_tokens_to_ids(label)
+
+            model_input = tokenizer(prompt_based_input,return_tensors="pt")
+            model_input = {k: v.cuda() for k, v in model_input.items()}
+
+            # 找到mask的位置
+            y_mask_index = 0
+            mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+            input_token_ids = model_input["input_ids"][0].tolist()
+            for i,e in enumerate(reversed(input_token_ids)):
+                if e == mask_id:
+                    y_mask_index = -(i+1) 
+                    break
+            assert y_mask_index < 0
+
+            if debias==False:
+                output = model(**model_input).logits
+                mask_token_logits = output[0][y_mask_index]
+                mask_token_logits = mask_token_logits.unsqueeze(dim=0)
+            else:
+                transformer_output = transformer_blocks(**model_input)[0]
+                mask_token_transformer_output = transformer_output[:,y_mask_index,:]
+                mask_token_features = tranform_layer(mask_token_transformer_output)
+                norm2 = torch.norm(mask_token_features[0], p=2)
+                mask_token_logits = decoder(mask_token_features) / norm2    
+                # 计算特定的debias logits值
+                bias_logits, bias_vector = self.get_template_bias_tensor(model,tokenizer,prompt_only_input)
+                bias_logits = bias_logits.to(mask_token_logits.device)
+                bias_vector = bias_vector.to(mask_token_logits.device)
+                # debias
+                mask_token_logits -= bias_logits
+                # 计算出来一个缩放参数，用于讲debias后的logits缩放到合理的范围
+                norm_bias = torch.norm(bias_vector,p=2)
+                norm_preds = norm2
+                normalized_pred_vecs = (mask_token_features.T/norm_preds).T
+                normlaized_bias_vec = bias_vector/norm_bias
+                debais_vecs = normalized_pred_vecs - normlaized_bias_vec
+                norm_debias = torch.norm(debais_vecs,dim=-1)
+                batch_scaling_vec = norm_preds/norm_debias
+                mask_token_logits = (mask_token_logits.T*batch_scaling_vec).T
+            
+            if vocab_subset_indices != None:
+                vocab_subset_indices = vocab_subset_indices.to(model.device)
+                mask_token_logits = mask_token_logits.index_select(dim=1,index=vocab_subset_indices)
+
+            predict_index = torch.argmax(mask_token_logits, dim=-1)
+            if probs == None:
+                probs = mask_token_logits
+            else:
+                probs = torch.cat((probs,mask_token_logits),dim=0)
+            
+            if vocab_subset_indices != None:
+                predict_index = vocab_subset_indices[predict_index]
+            allpreds.extend(predict_index.cpu().tolist())
+            alllabels.append(label)
+    
+        acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
+        # 对于vocab_subset的场景，allpreds和alllabels均是原始词表中的索引
+        return acc, (probs, allsubjs, allpreds, alllabels)
 
     def run_manual_prompt_all_relation(self,vocab_subset="common_vocab", embeddings_renormalize=False):
         save_path = self.work_dir + f"/outputs/renormalize/lama_{vocab_subset}_renormalize.csv" if embeddings_renormalize else self.work_dir + f"/outputs/renormalize/lama_{vocab_subset}.csv"
@@ -1081,6 +1207,178 @@ class Experiment():
             self.plm.set_output_embeddings(output_embedding_backup)
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
 
+
+    def experiment_renormal_vector_debais_for_templama(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens"):
+        root_dir = self.work_dir + f"/outputs/openprompt/manual_prompt/{self.model_name}"
+        save_dir = f"TEMPLAMA/debias_{vocab_subset}/"
+        dataset_names = ["templama"]
+        dataset_num = 1
+        files = [None]*dataset_num
+        img_save_dir = [None]*dataset_num
+
+        KL_save_path = os.path.join(root_dir, f"{save_dir}/KL.csv")
+        self.create_dir(KL_save_path)
+        KL_save_f = open(KL_save_path,"w")
+        KL_save_f.write("Relation")
+        preds_save_path = os.path.join(root_dir, f"{save_dir}/preds.pt")
+        
+        total_diff = [[]]
+        # 保存所有精度和所有KL散度
+        output_save = { 
+                        "TEMPLAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[]},
+                      }
+ 
+        # 保存所有预测结果
+        preds_save = {
+            "TEMPLAMA": {},
+        }
+
+        for i in range(dataset_num):
+            save_path = os.path.join(root_dir, f"{save_dir}/{dataset_names[i]}_difference_debias.csv") 
+            self.create_dir(save_path)
+            img_save_path =  os.path.join(root_dir, f"{save_dir}/img/{dataset_names[i]}")
+            img_save_dir[i] = img_save_path
+            f = open(save_path,"w")
+            f.write("relation,diff,origin,debias\n")
+            files[i] = f
+
+            KL_save_f.write(f",{dataset_names[i]}_before,{dataset_names[i]}_after")
+
+        # 统计tempLAMA中的relation
+        lama_relations = self.relations
+        self.relations = ["P39"]
+
+
+        pbar = tqdm(total=len(self.relations))
+
+        
+        for relation in self.relations:
+            templama_data_path = os.path.join(self.templama_data_dir,f"{relation}.jsonl")
+            # uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
+            # lama_whu_data_path = os.path.join(self.lama_whu_data_dir,f"{relation}.jsonl")
+            data_paths = [templama_data_path]
+
+            raw_template = "In [year], [X] holds the position of [Y]."
+            prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+            
+            subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer,include_templama_labels=True) \
+                                                if vocab_subset == "answer_type_tokens" else \
+                                    self.get_common_vocab_indices(self.tokenizer)
+            subvocab_indices_list = subvocab_tokens_indices.tolist()
+            
+            # bias向量需要一一计算
+            # 并行化
+            bias_distributions = []
+            test_dataset = load_jsonl(os.path.join(self.templama_data_dir,f"{relation}.jsonl"))
+            date_list = [i["date"] for i in test_dataset]
+            for date in date_list:
+                prompt_only_tempalte_with_year = prompt_only_tempalte.replace("[year]", date)
+                bias_tensor = self.generate_model_bias(
+                    self.plm, self.tokenizer, prompt_only_tempalte_with_year, 
+                    vocab_subset_indices=subvocab_tokens_indices, 
+                        return_logits=True) 
+                
+            
+                bias_probs = torch.softmax(bias_tensor,dim=-1).tolist()
+                # 用于计算KL散度
+                bias_dis = defaultdict(int, zip(subvocab_indices_list,bias_probs))
+                bias_distributions.append(bias_dis)
+
+            for i in range(len(data_paths)):
+                f = files[i]
+                acc_origin,(probs_before, sub_labels, preds_before, labels) = self.manual_prompt_for_templama(
+                    relation, debias=False, 
+                    vocab_subset_filter=vocab_subset_filter,
+                    vocab_subset=vocab_subset,)
+                acc_debias,(probs_after,_, preds_after, _) = self.manual_prompt_for_templama(
+                    relation, debias=True, 
+                    vocab_subset_filter=vocab_subset_filter, 
+                    vocab_subset=vocab_subset,)
+                
+                dataset = list(output_save.keys())[i]
+                output_save[dataset]["P"].append(acc_origin)
+                output_save[dataset]["P_d"].append(acc_debias)
+                
+                # 保存preds结果
+                obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
+                raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
+                debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
+                indices = list(range(len(sub_labels)))
+                preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
+
+                # 计算出来分布，用于绘图和计算KL散度
+                num_data = len(preds_before)
+                
+                probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
+                probs_dis_after = torch.softmax(probs_after,dim=-1).tolist()
+                KL_before_list = []
+                KL_after_list = []
+                for index in range(num_data):
+                    probs_dis_before_i = probs_dis_before[index]
+                    probs_dis_after_i = probs_dis_after[index]
+                    probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
+                    probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
+                    KL_before_list.append(self.kl_divergence(bias_distributions[i], probs_dis_before_i))
+                    KL_after_list.append(self.kl_divergence(bias_distributions[i], probs_dis_after_i))
+
+                KL_before = round(np.mean(KL_before_list),5)
+                KL_after = round(np.mean(KL_after_list),5) 
+
+                output_save[dataset]["KL"].append(KL_before)
+                output_save[dataset]["KL_d"].append(KL_after)
+
+                KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
+                
+
+                # print(f"debais前KL散度为{KL_before} debias后KL散度为{KL_after}")
+
+
+                # preds和labels均是原始词汇表里面的，绘图前需要转换成subset_vocab的索引
+                preds_before = [subvocab_indices_list.index(i) for i in preds_before]
+                preds_after = [subvocab_indices_list.index(i) for i in preds_after]
+
+                labels = [subvocab_indices_list.index(i) for i in labels]
+
+                img_save_path = os.path.join(img_save_dir[i], relation+".png")
+                self.create_dir(img_save_path)
+
+                self.generate_image(preds_before,preds_after,labels,model_bias=bias_tensor, save_path=img_save_path)
+
+
+                diff = round(acc_debias - acc_origin,5)
+                
+                print("{} 原始精度{} debias精度{}".format(
+                    dataset_names[i],
+                    round(acc_origin*100,2),
+                    round(acc_debias*100,2)))
+                total_diff[i].append(diff)
+                f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
+                f.flush()
+                pbar.update(1)
+                
+        pbar.close()
+        
+        for f in files:
+            if f != None:
+                f.close()
+        
+        KL_save_f.close()
+
+        # 处理输出
+        for i,dataset in enumerate(output_save.keys()):
+            avg_p = np.mean(output_save[dataset]["P"])
+            avg_p_d = np.mean(output_save[dataset]["P_d"])
+            avg_KL = np.mean(output_save[dataset]["KL"])
+            avg_KL_d = np.mean(output_save[dataset]["KL_d"])
+            self.add_output_item(self.model_name, dataset,prompt="manual_with_year",result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+        
+        self.print_output()
+
+        torch.save(preds_save,preds_save_path)
+
+        # 状态恢复
+        self.relations = lama_relations
+        
 
     def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False):
         """
@@ -1790,11 +2088,52 @@ class Experiment():
         
         return KL
 
+    def preprocess_tempLAMA(self):
+        # 对原始的tempLAMA数据集应用一些过滤，得到最后用于实验的数据集
+        # 过滤出单个token的example
+        data_dir = "/workspace/data/users/xuziyang/code/PromptBias/TruelyKnow/data/"
+        test_dataset = load_jsonl(data_dir+"TEMPLAMA/filtered_test.json")    
+
+
+        def in_vocab_single_token(x):
+            label = x["answer"][0]["name"]
+            return label in exp.lama_vocab_subset
+        
+        test_dataset = list(filter(in_vocab_single_token, test_dataset))
+
+        def before_2019(x):
+            return int(x["date"]) < 2019
+        
+        test_dataset = list(filter(before_2019, test_dataset))
+
+        # 按照relation划分成不同的数据集
+        relations = [item["relation"] for item in test_dataset]
+        relations = set(relations)
+        
+        for relation in relations:
+            def with_relation(x):
+                return x["relation"]==relation
+            filtered_data = list(filter(with_relation, test_dataset))
+            # 保存下来
+            with open(f"/workspace/data/users/xuziyang/code/PromptBias/TruelyKnow/data/TEMPLAMA/{relation}.jsonl", 'w') as f:
+                for i in filtered_data:
+                    line = json.dumps(i)
+                    # print(line)
+                    f.write(line)
+                    f.write("\n")
+            print(f"relation {relation}: {len(filtered_data)}")
+
+
 if __name__ == '__main__':
     exp = Experiment()
-    exp.init_model("bert","bert-large-cased")
-    exp.prior_on_yahoo()
-    
+    exp.init_model("bert","/workspace/data/users/vega/checkpoints/huggingface_model/bert-large-cased")
+    exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
+    exp.relations = ["P19"]
+    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA",ctrl_code=[0,1,0])
+    # exp.experiment_renormal_vector_debais_for_templama()
+    exit()
+    # exp.prior_on_yahoo()
+
 
     # exp.init_model("bert","bert-large-cased")
     # exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
