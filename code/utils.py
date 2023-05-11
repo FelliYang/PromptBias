@@ -50,3 +50,8 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def create_dir(self, path):
+        """create a dir and its parent dir recursively"""
+        dir_name = os.path.dirname(path)
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)

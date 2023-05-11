@@ -50,7 +50,7 @@ set_seed(args.seed)
 
 from truely_know import Experiment
 exp = Experiment()
-exp.init_model(args.model, args.model_name_or_path)
+exp.set_model(args.model, args.model_name_or_path)
 
 dataset = {}
 
@@ -180,7 +180,7 @@ content_free_template = content_free_template.replace("<input>", exp.tokenizer.m
 print("content_free_template: ***{}***".format(content_free_template))
 assert '{' not in content_free_template
 
-bias_logits, bias_vector = exp.get_template_bias_tensor(exp.plm, exp.tokenizer,template=content_free_template, y_mask_index=mask_id)
+bias_logits, bias_vector = exp.get_manual_prompt_bias(exp.plm, exp.tokenizer,template=content_free_template, object_index=mask_id)
 acc_debias_tra, _ = exp.evaluate(prompt_model,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector)
 print(acc_debias_tra)
 wandb.summary["debias_tra"] = acc_debias_tra
@@ -199,7 +199,7 @@ for i in range(3):
         tokenizer_wrapper_class=exp.WrapperClass, max_seq_length=max_seq_l, decoder_max_length=3,
         batch_size=batch_s,shuffle=False, teacher_forcing=False, predict_eos_token=False,
         truncate_method="tail")
-    bias_logits, bias_vector = exp.get_template_bias_tensor_by_sample(prompt_model, support_dataloader)
+    bias_logits, bias_vector = exp.get_prompt_bias_by_sample(prompt_model, support_dataloader)
     acc, _ = exp.evaluate(prompt_model,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector)
     acc_debias_sample.append(acc)
 print(acc_debias_sample)
@@ -218,7 +218,7 @@ content_free_template = content_free_template.replace("<input>", exp.tokenizer.m
 print("content_free_template: ***{}***".format(content_free_template))
 assert '{' not in content_free_template
 
-bias_logits, bias_vector = exp.get_template_bias_tensor(exp.plm, exp.tokenizer,template=content_free_template, y_mask_index=mask_id)
+bias_logits, bias_vector = exp.get_manual_prompt_bias(exp.plm, exp.tokenizer,template=content_free_template, object_index=mask_id)
 cc_logits = torch.norm(bias_vector)*bias_logits
 cc_logits = cc_logits.to(prompt_model.device)
 acc_calibration_tra, _ = exp.evaluate(prompt_model,test_dataloader, calibration=True, calib_logits=cc_logits)

@@ -54,7 +54,7 @@ set_seed(args.seed)
 
 from truely_know import Experiment
 exp = Experiment()
-exp.init_model(args.model, args.model_name_or_path)
+exp.set_model(args.model, args.model_name_or_path)
 
 # FIXME: 修复soft template情况下的mask 位置不正确问题
 def find_mask_id(exp, content_free_template):
@@ -78,7 +78,7 @@ def get_debias_vector():
     支持采样模式和mask模式来估计
     """
     if args.educated_by_sample:
-        bias_logits, bias_vector = exp.get_template_bias_tensor_by_sample(prompt_model, support_dataloader, evaluteMode=False)
+        bias_logits, bias_vector = exp.get_prompt_bias_by_sample(prompt_model, support_dataloader, evaluateMode=False)
     else:
         # 使用mask直接debias
         # mask_id = find_mask_id(exp, templateOnly)
@@ -101,7 +101,7 @@ def get_debias_vector():
         # 添加一个batch维度
         input_batch = {key: torch.unsqueeze(input_batch[key], dim=0) for key in input_batch}
         # 使用该batch来得到bias向量
-        bias_logits, bias_vector = exp.get_template_bias_tensor(exp.plm, exp.tokenizer,template="soft mask", template_embeddings=input_batch, y_mask_index=mask_id)
+        bias_logits, bias_vector = exp.get_manual_prompt_bias(exp.plm, exp.tokenizer,template="soft mask", template_embeddings=input_batch, object_index=mask_id)
 
     return bias_logits, bias_vector
 

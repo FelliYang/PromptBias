@@ -24,8 +24,8 @@ exp = Experiment()
 exp.learning_rate = args.learning_rate
 exp.num_epochs = args.epochs
 
-exp.init_model(args.model_type, args.model_name)
-exp.init_common_vocab(os.path.join(exp.work_dir, "common_vocabs", args.common_vocab))
+exp.set_model(args.model_type, args.model_name)
+exp.set_common_vocab(os.path.join(exp.work_dir, "common_vocabs", args.common_vocab))
 if args.prompt in manual_prompts:
     exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt=args.prompt)
 else:
