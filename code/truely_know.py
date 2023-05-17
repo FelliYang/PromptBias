@@ -1517,7 +1517,7 @@ class Experiment():
 
         # results for all exps
         output_results = []
-        for index in range(1,repeat_times+1):
+        for _index in range(1,repeat_times+1):
             self.clear_output()
             root_dir = self.work_dir + f"/outputs/openprompt/continue_prompt/{self.model_name}"
             
@@ -1654,7 +1654,7 @@ class Experiment():
                     f.flush()
                     
                     postfox = {
-                        "run nums": index,
+                        "run nums": _index,
                         "lama_improve": 0 if ctrl_code[0]==0 or len(total_diff[0])==0 else round(sum(total_diff[0])/len(total_diff[0]), 3) * 100,
                         "uni_improve": 0 if ctrl_code[1]==0 or len(total_diff[1])==0 else round(sum(total_diff[1])/len(total_diff[1]), 3) * 100,
                         "lama_whu_improve": 0 if ctrl_code[2]==0 or len(total_diff[2])==0 else round(sum(total_diff[2])/len(total_diff[2]), 3) * 100,
@@ -2007,8 +2007,8 @@ if __name__ == '__main__':
     set_seed(7)
     exp = Experiment()
     output_dir = "./output/"
-    exp.init_model("bert","bert-large-cased")
-    exp.init_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
+    exp.set_model("bert","bert-base-cased")
+    exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
     exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
