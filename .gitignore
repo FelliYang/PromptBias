@@ -1,9 +1,12 @@
 # output dir
 outputs/
+output/
 # temp dir
 temp/
 # data dir
 data/
+# doc file
+*.html
 # vscode
 .vscode/
 # Byte-compiled / optimized / DLL files

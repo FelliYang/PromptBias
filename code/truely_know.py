@@ -777,7 +777,7 @@ class Experiment():
         promptModel.cuda()
 
         if debias:
-            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector,scaling_debiased_logit=True, vocab_subset_indices=subset_indices)
+            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices)
         else:
             acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
 
@@ -867,18 +867,18 @@ class Experiment():
 
             if debias==False:
                 output = model(**model_input).logits
-                mask_token_logits = output[0][y_mask_index]
-                mask_token_logits = mask_token_logits.unsqueeze(dim=0)
+                batched_debiased_logits = output[0][y_mask_index]
+                batched_debiased_logits = batched_debiased_logits.unsqueeze(dim=0)
             else:
                 transformer_output = transformer_blocks(**model_input)[0]
                 mask_token_transformer_output = transformer_output[:,y_mask_index,:]
                 mask_token_features = tranform_layer(mask_token_transformer_output)
                 norm2 = torch.norm(mask_token_features[0], p=2)
-                mask_token_logits = decoder(mask_token_features) / norm2    
+                batched_debiased_logits = decoder(mask_token_features) / norm2    
                 bias_logits, bias_vector = self.get_manual_prompt_bias(model,tokenizer,prompt_only_input)
-                bias_logits = bias_logits.to(mask_token_logits.device)
-                bias_vector = bias_vector.to(mask_token_logits.device)
-                mask_token_logits -= bias_logits
+                bias_logits = bias_logits.to(batched_debiased_logits.device)
+                bias_vector = bias_vector.to(batched_debiased_logits.device)
+                batched_debiased_logits -= bias_logits
                 # scale the debiased logits to a resonable range
                 norm_bias = torch.norm(bias_vector,p=2)
                 norm_preds = norm2
@@ -887,17 +887,17 @@ class Experiment():
                 debais_vecs = normalized_pred_vecs - normlaized_bias_vec
                 norm_debias = torch.norm(debais_vecs,dim=-1)
                 batch_scaling_vec = norm_preds/norm_debias
-                mask_token_logits = (mask_token_logits.T*batch_scaling_vec).T
+                batched_debiased_logits = (batched_debiased_logits.T*batch_scaling_vec).T
             
             if vocab_subset_indices != None:
                 vocab_subset_indices = vocab_subset_indices.to(model.device)
-                mask_token_logits = mask_token_logits.index_select(dim=1,index=vocab_subset_indices)
+                batched_debiased_logits = batched_debiased_logits.index_select(dim=1,index=vocab_subset_indices)
 
-            predict_index = torch.argmax(mask_token_logits, dim=-1)
+            predict_index = torch.argmax(batched_debiased_logits, dim=-1)
             if probs == None:
-                probs = mask_token_logits
+                probs = batched_debiased_logits
             else:
-                probs = torch.cat((probs,mask_token_logits),dim=0)
+                probs = torch.cat((probs,batched_debiased_logits),dim=0)
             
             if vocab_subset_indices != None:
                 predict_index = vocab_subset_indices[predict_index]
@@ -1074,7 +1074,7 @@ class Experiment():
 
         results  = {}
         for dataset in ["lama","uni","lama_whu"]:
-            debias_output = self.evaluate(promptModel, test_dataloader[dataset], bias_logits=bias_logits, bias_vector=bias_vector, scaling_debiased_logit=True,vocab_subset_indices=subset_indices,soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+            debias_output = self.evaluate(promptModel, test_dataloader[dataset], bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices,soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
             origin_output = self.evaluate(promptModel, test_dataloader[dataset], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
             acc_, (probs_, preds_, labels_) = debias_output
             debias_output = acc_, (probs_, sub_labels[dataset],preds_, labels_)
@@ -1760,7 +1760,6 @@ class Experiment():
 
     def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader,
                 bias_logits=None, bias_vector=None, 
-                scaling_debiased_logit=False, 
                 vocab_subset_indices=None,
                 soft_tempalte_ckpt=None, 
                 continue_prompt="prefix",num_tokens=5,
@@ -1772,8 +1771,6 @@ class Experiment():
             data_loader (PromptDataLoader): the evaluation dataset loader 
             bias_logits (tensor, optional): the normalized bias vector. Defaults to None.
             bias_vector (tensor, optional): the raw bias vector.. Defaults to None.
-            scaling_debiased_logit (bool, optional): whether to scale the debiased logits to a suitable value range. 
-                Defaults to False.
             vocab_subset_indices (tensor, optional): filter the model bias distribution on the specified vocab subset. 
                 Defaults to None.
             soft_tempalte_ckpt (str, optional): the saved weights of the continue prompt. Defaults to None.
@@ -1831,40 +1828,7 @@ class Experiment():
             inputs =  inputs.cuda()
             with torch.no_grad():
                 if bias_logits!=None:
-                    if isinstance(promptModel, PromptForClassification):
-                        # promptModel(inputs)
-                        # 以下逻辑是把openprompt的forward抄了过来
-                        batch = promptModel.template.process_batch(inputs)
-                        input_batch = {key: batch[key] for key in batch if key in promptModel.prompt_model.forward_keys}
-                        transformer_output = transformer_blocks(**input_batch)[0]
-                        # 对于softtemplate，这里有一个后处理
-                        if isinstance(promptModel.template,SoftTemplate):
-                            # 去掉softembedding
-                            transformer_output = transformer_output[:,num_tokens:,:]
-                        mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
-                        mask_token_features = tranform_layer(mask_token_transformer_output)
-
-                        # linear层之后的特征向量, 论文理论框架中用于debias的向量
-                        prediction_vectors = mask_token_features
-                        mask_token_logits = None
-                        for i in range(mask_token_features.shape[0]):
-                            norm2 = torch.norm(mask_token_features[i], p=2)
-                            temp = decoder(mask_token_features[i]).unsqueeze(dim=0) / norm2
-                            if mask_token_logits == None:
-                                mask_token_logits = temp
-                            else:
-                                mask_token_logits = torch.cat((mask_token_logits,temp),dim=0)
-                        
-                        mask_logits = mask_token_logits
-
-                         # 对分布做debias
-                        mask_logits -= bias_logits
-                        
-                        # 从forward逻辑中中抄过来的
-                        mask_logits =  promptModel.verbalizer.process_outputs(mask_logits, batch=inputs)
-                       
-
-                    elif isinstance(promptModel, PromptModel):
+                    if isinstance(promptModel, PromptModel):
                         # 以下逻辑是把openprompt的forward抄了过来
                         batch = promptModel.template.process_batch(inputs)                                                                                                               
                         input_batch = {key: batch[key] for key in batch if key in promptModel.forward_keys}
@@ -1879,38 +1843,60 @@ class Experiment():
                         # linear层之后的特征向量, 论文理论框架中用于debias的向量
                         prediction_vectors = mask_token_features
 
-                        mask_token_logits = None
+                        batched_debiased_logits = None
+                        D_T = bias_vector / torch.norm(bias_vector)
                         for i in range(mask_token_features.shape[0]):
-                            norm2 = torch.norm(mask_token_features[i], p=2)
-                            temp = decoder(mask_token_features[i]).unsqueeze(dim=0) / norm2
-                            if mask_token_logits == None:
-                                mask_token_logits = temp
+                            D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i])
+                            D_debias = (D_Tx - D_T) / torch.norm(D_Tx - D_T)
+                            V_debias = D_debias * torch.norm(mask_token_features[i])
+                            debiased_logits = decoder(V_debias).unsqueeze(dim=0)
+                            if batched_debiased_logits == None:
+                                batched_debiased_logits = debiased_logits
                             else:
-                                mask_token_logits = torch.cat((mask_token_logits,temp),dim=0)
+                                batched_debiased_logits = torch.cat((batched_debiased_logits,debiased_logits),dim=0)
                         
-                        mask_logits = mask_token_logits
+                        mask_logits = batched_debiased_logits
                         if vocab_subset_indices != None:
                             mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
-                        # 对分布做debias
-                        mask_logits -= bias_logits
+                            
+                    elif isinstance(promptModel, PromptForClassification):
+                        # 一定有verbalizer 來做分类
+                        assert promptModel.verbalizer != None
+                        # 以下逻辑是把openprompt的forward抄了过来
+                        batch = promptModel.template.process_batch(inputs)
+                        input_batch = {key: batch[key] for key in batch if key in promptModel.prompt_model.forward_keys}
+                        transformer_output = transformer_blocks(**input_batch)[0]
+                        # 对于softtemplate，这里有一个后处理
+                        if isinstance(promptModel.template,SoftTemplate):
+                            # 去掉softembedding
+                            transformer_output = transformer_output[:,num_tokens:,:]
+                        mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
+                        mask_token_features = tranform_layer(mask_token_transformer_output)
 
-                    # 计算出来一个缩放参数，用于讲debias后的logits缩放到合理的范围
-                    if scaling_debiased_logit:
-                        norm_bias = torch.norm(bias_vector,p=2)
-                        norm_preds = torch.norm(prediction_vectors,dim=-1)
-                        normalized_pred_vecs = (prediction_vectors.T/norm_preds).T
-                        normlaized_bias_vec = bias_vector/norm_bias
-                        debais_vecs = normalized_pred_vecs - normlaized_bias_vec
-                        norm_debias = torch.norm(debais_vecs,dim=-1)
-                        batch_scaling_vec = norm_preds/norm_debias
-                        mask_logits = (mask_logits.T*batch_scaling_vec).T
+                        # linear层之后的特征向量, 论文理论框架中用于debias的向量
+                        prediction_vectors = mask_token_features
+                        batched_debiased_logits = None
+                        D_T = bias_vector / torch.norm(bias_vector)
+                        for i in range(mask_token_features.shape[0]):
+                            D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i])
+                            D_debias = D_Tx - D_T / torch.norm(D_Tx - D_T)
+                            V_debias = D_debias * torch.norm(mask_token_features[i])
+                            debiased_logits = decoder(V_debias).unsqueeze(dim=0)
+                            if batched_debiased_logits == None:
+                                batched_debiased_logits = debiased_logits
+                            else:
+                                batched_debiased_logits = torch.cat((batched_debiased_logits,debiased_logits),dim=0)
+                        
+                        mask_logits = batched_debiased_logits
+                        
+                        # 对于分类任务来说，不需要typed quering，因为verbalizer已经限定了answer space
+                        
+                        # 从forward逻辑中中抄过来的
+                        mask_logits =  promptModel.verbalizer.process_outputs(mask_logits, batch=inputs)
 
                 else:
                     if isinstance(promptModel, PromptForClassification):
                         mask_logits = promptModel(inputs)
-                        # # 执行verbalizer
-                        # mask_logits =  promptModel.verbalizer.process_outputs(mask_logits, batch=inputs)
-
                     else:
                         logits = promptModel(inputs).logits
                         mask_logits = logits[torch.where(inputs['loss_ids']>0)]
@@ -1935,8 +1921,7 @@ class Experiment():
         
         acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
        
-
-        # calibration 副作用需要手动
+        # calibration 副作用需要手动恢复
         if calibration:
             promptModel.verbalizer._calibrate_logits = None
         # allpreds and alllabels are indice of the raw dataset
@@ -2010,10 +1995,9 @@ if __name__ == '__main__':
     exp.set_model("bert","bert-base-cased")
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
-    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-    exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-    exp.save_output(output_dir+"/bert-large-cased/bert_vocab_intersection_result_new.json")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+    exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_new.json")
     exp.print_output()
     exp.clear_output()
-
