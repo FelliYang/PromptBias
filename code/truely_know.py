@@ -560,7 +560,7 @@ class Experiment():
         # if not isinstance(transformer_blocks, torch.nn.DataParallel):
         #     transformer_blocks  = torch.nn.DataParallel(transformer_blocks)
         
-        assert isinstance(promptModel, PromptForClassification), "Current this func only support PromptForClassification"
+        # assert isinstance(promptModel, PromptForClassification), "Current this func only support PromptForClassification"
         all_prediction_vectors = None
         for inputs in support_dataloader:
             inputs = inputs.to(promptModel.device)
@@ -580,11 +580,21 @@ class Experiment():
             else:
                 all_prediction_vectors = torch.cat((all_prediction_vectors, mask_token_features), dim=0)
             
+        # avg_prediction_vector = torch.mean(all_prediction_vectors,dim=0)
+        # avg_norm = torch.norm(avg_prediction_vector).item()
+        # avg_logits = torch.mean(decoder(all_prediction_vectors), dim=0)
+        # normalized_avg_logits = avg_logits / avg_norm
+
+        # 方案1 直接对vector做一个平均
         avg_prediction_vector = torch.mean(all_prediction_vectors,dim=0)
         avg_norm = torch.norm(avg_prediction_vector).item()
         avg_logits = torch.mean(decoder(all_prediction_vectors), dim=0)
         normalized_avg_logits = avg_logits / avg_norm
 
+        # 方案2 对vector的方向做一个平均
+        # normalized_prediction_vector = torch.norm(all_prediction_vectors,dim=1)
+        # avg_normalized_prediction_vector =torch.mean(all_prediction_vectors,dim=0)
+        
         if evaluateMode==True:
             normalized_avg_logits = normalized_avg_logits.detach()
             avg_prediction_vector = avg_prediction_vector.detach()
@@ -672,7 +682,7 @@ class Experiment():
         return all_logits    
 
 
-    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,  embeddings_renormalize=False, prompt="LAMA" ):
+    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,  embeddings_renormalize=False, prompt="LAMA", sampling_debias=False):
         """Probe factual knowledge in the model with a manual prompt.
 
         Args:
@@ -768,6 +778,15 @@ class Experiment():
         test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=tokenizer,
             tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
             batch_size=16,shuffle=False)
+        
+        if sampling_debias==True:
+            # support dataset for sampling
+            support_sampler = FewShotSampler(num_examples_total=200, also_sample_dev=False)
+            dataset['support'] = support_sampler(dataset['test'], seed=6)
+            support_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=tokenizer,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
+                batch_size=16, shuffle=False)
+            bias_logits, bias_vector = self.get_prompt_bias_by_sample(model, support_dataloader)
         
         promptModel = PromptModel(
             template = prompt_template,
@@ -1084,8 +1103,9 @@ class Experiment():
 
         return model_bias_output, results
             
-
-    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], manual_prompt="LAMA"):
+    
+    # TODO:对manual实现一下sample debias策略
+    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False):
         """Debiasing experiments for manual prompts. 
 
         Args:
@@ -1219,7 +1239,8 @@ class Experiment():
                     vocab_subset_filter=vocab_subset_filter, 
                     vocab_subset=vocab_subset,
                     test_data_path=data_paths[i],
-                    prompt=manual_prompt)
+                    prompt=manual_prompt,
+                    sampling_debias=sampling_debias)
                 
                 dataset = list(output_save.keys())[i]
                 output_save[dataset]["P"].append(acc_origin)
