@@ -561,25 +561,46 @@ class Experiment():
         #     transformer_blocks  = torch.nn.DataParallel(transformer_blocks)
         
         # assert isinstance(promptModel, PromptForClassification), "Current this func only support PromptForClassification"
+        
         all_prediction_vectors = None
-        for inputs in support_dataloader:
-            inputs = inputs.to(promptModel.device)
-            # copy the following code from OpenPrompt library
-            batch = promptModel.template.process_batch(inputs)
-            input_batch = {key: batch[key] for key in batch if key in promptModel.prompt_model.forward_keys}
-            transformer_output = transformer_blocks(**input_batch)[0]
-            # post process only for soft template
-            if isinstance(promptModel.template, SoftTemplate):
-                transformer_output = transformer_output[:,num_tokens:,:]
-            mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
-            mask_token_features = tranform_layer(mask_token_transformer_output)
-            
-            # accumlate the debias vector
-            if all_prediction_vectors==None:
-                all_prediction_vectors = mask_token_features
-            else:
-                all_prediction_vectors = torch.cat((all_prediction_vectors, mask_token_features), dim=0)
-            
+        # 如果输入的模型是分类模型，在前向过程中会稍有不同
+        if isinstance(promptModel, PromptForClassification):
+            for inputs in support_dataloader:
+                inputs = inputs.to(promptModel.device)
+                # copy the following code from OpenPrompt library
+                batch = promptModel.template.process_batch(inputs)
+                input_batch = {key: batch[key] for key in batch if key in promptModel.prompt_model.forward_keys}
+                transformer_output = transformer_blocks(**input_batch)[0]
+                # post process only for soft template
+                if isinstance(promptModel.template, SoftTemplate):
+                    transformer_output = transformer_output[:,num_tokens:,:]
+                mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
+                mask_token_features = tranform_layer(mask_token_transformer_output)
+                
+                # accumlate the debias vector
+                if all_prediction_vectors==None:
+                    all_prediction_vectors = mask_token_features
+                else:
+                    all_prediction_vectors = torch.cat((all_prediction_vectors, mask_token_features), dim=0)
+        else:
+            for inputs in support_dataloader:
+                inputs = inputs.cuda()
+                # copy the following code from OpenPrompt library
+                batch = promptModel.template.process_batch(inputs)
+                input_batch = {key: batch[key] for key in batch if key in promptModel.forward_keys}
+                transformer_output = transformer_blocks(**input_batch)[0]
+                # post process only for soft template
+                if isinstance(promptModel.template, SoftTemplate):
+                    transformer_output = transformer_output[:,num_tokens:,:]
+                mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
+                mask_token_features = tranform_layer(mask_token_transformer_output)
+                
+                # accumlate the debias vector
+                if all_prediction_vectors==None:
+                    all_prediction_vectors = mask_token_features
+                else:
+                    all_prediction_vectors = torch.cat((all_prediction_vectors, mask_token_features), dim=0)
+             
         # avg_prediction_vector = torch.mean(all_prediction_vectors,dim=0)
         # avg_norm = torch.norm(avg_prediction_vector).item()
         # avg_logits = torch.mean(decoder(all_prediction_vectors), dim=0)
@@ -592,8 +613,11 @@ class Experiment():
         normalized_avg_logits = avg_logits / avg_norm
 
         # 方案2 对vector的方向做一个平均
-        # normalized_prediction_vector = torch.norm(all_prediction_vectors,dim=1)
-        # avg_normalized_prediction_vector =torch.mean(all_prediction_vectors,dim=0)
+        # prediction_vector_norm = torch.norm(all_prediction_vectors,dim=1)
+        # normalied_prediction_vector = (all_prediction_vectors.T / prediction_vector_norm).T
+        # avg_normalized_prediction_vector =torch.mean(normalied_prediction_vector,dim=0)
+        # avg_prediction_vector = avg_normalized_prediction_vector
+
         
         if evaluateMode==True:
             normalized_avg_logits = normalized_avg_logits.detach()
@@ -779,6 +803,13 @@ class Experiment():
             tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
             batch_size=16,shuffle=False)
         
+        promptModel = PromptModel(
+            template = prompt_template,
+            plm = plm,
+            freeze_plm=True
+        )
+        promptModel.cuda()
+        
         if sampling_debias==True:
             # support dataset for sampling
             support_sampler = FewShotSampler(num_examples_total=200, also_sample_dev=False)
@@ -786,15 +817,8 @@ class Experiment():
             support_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=tokenizer,
                 tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                 batch_size=16, shuffle=False)
-            bias_logits, bias_vector = self.get_prompt_bias_by_sample(model, support_dataloader)
+            bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
         
-        promptModel = PromptModel(
-            template = prompt_template,
-            plm = plm,
-            freeze_plm=True
-        )
-        promptModel.cuda()
-
         if debias:
             acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices)
         else:
@@ -2015,10 +2039,10 @@ if __name__ == '__main__':
     output_dir = "./output/"
     exp.set_model("bert","bert-base-cased")
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
-    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA", sampling_debias=True)
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
     # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-    exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_new.json")
+    exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_sampling_debias.json")
     exp.print_output()
     exp.clear_output()
