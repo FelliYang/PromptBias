@@ -1,8 +1,11 @@
 # output dir
 outputs/
 output/
+analysis/
+results/
 # temp dir
 temp/
+test/
 # data dir
 data/
 # doc file

@@ -1129,7 +1129,7 @@ class Experiment():
             
     
     # TODO:对manual实现一下sample debias策略
-    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False):
+    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False):
         """Debiasing experiments for manual prompts. 
 
         Args:
@@ -2039,7 +2039,7 @@ if __name__ == '__main__':
     output_dir = "./output/"
     exp.set_model("bert","bert-base-cased")
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
-    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA", sampling_debias=True)
+    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
     # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
