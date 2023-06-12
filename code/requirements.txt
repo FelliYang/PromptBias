@@ -1,0 +1,6 @@
+transformers
+openprompt
+scikit-learn
+prettytable
+matplotlib
+orjson

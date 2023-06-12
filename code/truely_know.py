@@ -38,12 +38,15 @@ from prettytable import PrettyTable
 import copy
 
 class Experiment():
-    def __init__(self) -> None:
+    def __init__(self, seed=7, support_dataset=200) -> None:
         # settting
         self.CONTINUE_PROMPT_NUM = 5
         self.num_epochs = 10
         self.learning_rate = 3e-3
         self.warmup_proportion = 0.1
+        self.seed=seed
+        self.support_dataset = support_dataset
+        set_seed(self.seed)
 
         # output save
         self.output_result = {}
@@ -145,7 +148,7 @@ class Experiment():
         self.output_result[model][dataset][prompt] = {"P":result[0], "P_d":result[1], "KL":result[2], "KL_d":result[3]}
     
 
-    def load_data(self, data_path, common_vocab=None, filter_repeat=True, return_resample_weights=False, ):
+    def load_data(self, data_path, common_vocab=None, filter_repeat=True, return_resample_weights=False, close_filter=False):
         """load and preprocess a dataset. 
         
         The raw dataset is assumed to be a .jsonl or .json file, with data items <sub_label, relation, obj_label>.
@@ -155,6 +158,7 @@ class Experiment():
             common_vocab (list, optional): . Defaults to None.
             filter_repeat (bool, optional): whether to filter out repeat data items. Defaults to True.
             return_resample_weights (bool, optional): whether to return a resample weights, which can be used to avoid a extreme label distribution in training. Defaults to False.
+            close_filter (bool, optional): whether to close all filters
 
         Returns:
             (list, None): the dataset loaded.
@@ -177,14 +181,14 @@ class Experiment():
             exit(-1)
 
         # filter out obj_label that not in the common_vocab
-        if common_vocab:
+        if not close_filter and common_vocab:
             current_len = len(data)
             data = list(filter(lambda x: x["obj_label"] in common_vocab, data))
             print("filter out {} items since the vocab_subset".format(current_len - len(data)))
         
 
         # filter out repeat data items
-        if filter_repeat:
+        if not close_filter and filter_repeat:
             current_len = len(data)
             sub_obj_set = set()
             for item in data:
@@ -269,6 +273,8 @@ class Experiment():
 
     def get_answer_entity_indices(self, relation, 
                 tokenizer:PreTrainedTokenizer, 
+                include_multi_lama=True,
+                include_lama_labels=True,
                 include_uni_labels=True, 
                 include_templama_labels=False,
                 common_vocab_intersection=True):
@@ -281,8 +287,11 @@ class Experiment():
         Args:
             relation (str): the target relation
             tokenizer (PreTrainedTokenizer): tokenizer of the pretrained languaage model
-            include_uni_labels (bool, optional): whether to consider the labels of the same `relation` in UNI dataset into the answer space. 
+            include_multi_lama (bool, optional): whether to consider the entity.json into the answer space. Defaults to True. 
+            include_lama_labels (bool, optional): whether to consider the labels of the same `relation` in LAMA dataset into the answer space. 
                 In default, we had consideres the labels of LAMA dataset. Defaults to True. 
+            include_uni_labels (bool, optional): whether to consider the labels of the same `relation` in UNI dataset into the answer space. 
+                In default, we had consideres the labels of UNI dataset. Defaults to True. 
             include_templama_labels (bool, optional): whether to consider the labels of the same `relation` in TEMPLAMA dataset into the answer space.
                 Defaults to False.
             common_vocab_intersection (bool, optional): whether to intersect the answer space with common vocab to ensure 
@@ -294,15 +303,19 @@ class Experiment():
 
         # take the entity.json as the base answer space, which is constructed by 
         # "multilingual lama: investigating knowledge in multilingual pretrained language models"
-        entity_path = self.work_dir + "/data/entity.json"
-        entity_data = load_json(entity_path)[relation]
-        entity_data = entity_data["objects"]
+        entity_data = []
+
+        if include_multi_lama:
+            entity_path = self.work_dir + "/data/entity.json"
+            entity_data = load_json(entity_path)[relation]
+            entity_data = entity_data["objects"]
 
         # add labels of the same relation in LAMA dataset to the answer space
-        lama_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
-        lama_data = load_jsonl(lama_path)
-        lama_labels = [ item["obj_label"] for item in lama_data]
-        entity_data += lama_labels
+        if include_lama_labels:
+            lama_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
+            lama_data = load_jsonl(lama_path)
+            lama_labels = [ item["obj_label"] for item in lama_data]
+            entity_data += lama_labels
 
         if include_uni_labels:
             # add labels of the same relation in UNI dataset to the answer space
@@ -629,6 +642,123 @@ class Experiment():
         return bias_logits, bias_features
 
 
+    def get_probs_by_sample(self, promptModel:PromptModel, support_dataloader, subvocab_indices_list, bias_vector, num_tokens=5):
+        """Generate the avg probs on the support_dataloader based on sampling strategy. Suitable for both manual and continue prompts.
+
+
+        Args:
+            promptModel (PromptModel): an OpenPrompt wrapeed model.
+            support_dataloader (Dataset): the sample dataset used to esitimate the bias tensor.
+                200 samples will be a good number in practice.
+            bias_vector (tensor): the prompt bias representation vector.
+
+        Returns:
+            probs : a list of the probabilities.
+        """
+        promptModel.eval()
+
+        # The following is an unified framework splitting the process of language model into 3 parts
+        # 1. transformer block
+        # 2. transform layer
+        # 3. decoder
+        model = promptModel.plm
+        if isinstance(model, BertForMaskedLM):
+            transformer_blocks = model.bert
+            tranform_layer  = model.cls.predictions.transform
+            decoder = model.cls.predictions.decoder
+        elif isinstance(model, RobertaForMaskedLM):
+            transformer_blocks = model.roberta
+            tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
+            decoder = model.lm_head.decoder
+        
+        all_prediction_vectors = None
+
+        for inputs in support_dataloader:
+            inputs = inputs.cuda()
+            # copy the following code from OpenPrompt library
+            batch = promptModel.template.process_batch(inputs)
+            input_batch = {key: batch[key] for key in batch if key in promptModel.forward_keys}
+            transformer_output = transformer_blocks(**input_batch)[0]
+            # post process only for soft template
+            if isinstance(promptModel.template, SoftTemplate):
+                transformer_output = transformer_output[:,num_tokens:,:]
+            mask_token_transformer_output = transformer_output[torch.where(inputs['loss_ids']>0)]
+            mask_token_features = tranform_layer(mask_token_transformer_output)
+            
+            # accumlate the debias vector
+            if all_prediction_vectors==None:
+                all_prediction_vectors = mask_token_features
+            else:
+                all_prediction_vectors = torch.cat((all_prediction_vectors, mask_token_features), dim=0)
+
+        # 方案1 直接对vector做一个平均
+        # avg_prediction_vector = torch.mean(all_prediction_vectors,dim=0)
+        # avg_norm = torch.norm(avg_prediction_vector).item()
+        logits = decoder(all_prediction_vectors)
+        logits = logits[:, subvocab_indices_list]
+        avg_logit = torch.mean(logits, dim=0)
+        normalize_logits = avg_logit - torch.mean(avg_logit)
+        norm_probs = torch.softmax(normalize_logits,dim=0)
+        
+
+        # 方案2 对vector的方向做一个平均
+        # prediction_vector_norm = torch.norm(all_prediction_vectors,dim=1)
+        # normalied_prediction_vector = (all_prediction_vectors.T / prediction_vector_norm).T
+        # avg_normalized_prediction_vector =torch.mean(normalied_prediction_vector,dim=0)
+        # avg_prediction_vector = avg_normalized_prediction_vector
+
+        # 使用debias过后的vector来估计prompt bias
+        bias_vector = bias_vector.cuda()
+        batched_debiased_logits = None
+        D_T = bias_vector / torch.norm(bias_vector)
+        for i in range(len(all_prediction_vectors)):
+            D_Tx = all_prediction_vectors[i] / torch.norm(all_prediction_vectors[i])
+            D_debias = (D_Tx - D_T) / torch.norm(D_Tx - D_T)
+            V_debias = D_debias * torch.norm(all_prediction_vectors[i])
+            debiased_logits = decoder(V_debias).unsqueeze(dim=0)
+            if batched_debiased_logits == None:
+                batched_debiased_logits = debiased_logits
+            else:
+                batched_debiased_logits = torch.cat((batched_debiased_logits,debiased_logits),dim=0)
+
+        batched_debiased_logits = batched_debiased_logits[:, subvocab_indices_list]
+        avg_debias_logit = torch.mean(batched_debiased_logits, dim=0)
+        normalize_debias_logits = avg_debias_logit - torch.mean(avg_debias_logit)
+        norm_debias_probs = torch.softmax(normalize_debias_logits,dim=0)
+
+
+        # 测试精度
+        # allpreds = torch.argmax(batched_debiased_logits[:,subvocab_indices_list],dim=1)
+        # allpreds = torch.tensor(subvocab_indices_list)[allpreds].tolist()
+        # alllabels = []
+        # for inputs in support_dataloader:
+        #     labels = inputs["label"]
+        #     alllabels += labels.cpu().tolist()
+        
+        # acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
+        # print(acc)
+        # exit()
+
+        return norm_probs, norm_debias_probs
+
+    
+    def save_KL_results(self, results, path):
+        """Save the KL results into the specific path.
+
+        Args:
+            results (tuple): the output of the func `quantify_prompt_bias`
+            path (str): the target saving path
+        """
+        reformat_results = {
+            "raw_KL": results[0],
+            "debiased_KL": results[1],
+            "details": results[2]
+        }
+        str = json.dumps(reformat_results, indent=4)
+        with open(path, "w") as f:
+            f.write(str)
+
+
     def generate_image(self, before_debias_preds, after_debias_preds, labels, model_bias, save_path="test.png"):
         """Draw some images before and after debiasing on a given dataset.
 
@@ -717,6 +847,7 @@ class Experiment():
             test_data_path (str, optional): A dataset used to evaluate how many facts contained in the model. Defaults to None.
             embeddings_renormalize (bool, optional): Whether to renormalize the embeddings of the model before probing. Defaults to False.
             prompt (str, optional): The prompt series used in probing. Defaults to "LAMA". Could also be "LPAQA", "AutoPrompt".
+            sampling_debias (str, optional): Whether to use sampling debiasing strategy to mitigate the prompt bias.
 
         Raises:
             ValueError: when `vocab_subset` is set to an invalid value.
@@ -794,7 +925,7 @@ class Experiment():
 
         # constrct a prompt_pnly_template used to calculate the prompt bias vector
         prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
-        bias_logits, bias_vector = self.get_manual_prompt_bias(model,tokenizer,template=prompt_only_tempalte)
+        bias_logits, bias_vector = self.get_manual_prompt_bias(model,tokenizer, template=prompt_only_tempalte)
 
         # get the max pad number in dataset
         max_tokens_len = self.compute_max_pad(dataset, WrapperClass, tokenizer, prompt_template)
@@ -813,7 +944,7 @@ class Experiment():
         if sampling_debias==True:
             # support dataset for sampling
             support_sampler = FewShotSampler(num_examples_total=200, also_sample_dev=False)
-            dataset['support'] = support_sampler(dataset['test'], seed=6)
+            dataset['support'] = support_sampler(dataset['test'], seed=self.seed)
             support_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=tokenizer,
                 tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                 batch_size=16, shuffle=False)
@@ -1128,7 +1259,6 @@ class Experiment():
         return model_bias_output, results
             
     
-    # TODO:对manual实现一下sample debias策略
     def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False):
         """Debiasing experiments for manual prompts. 
 
@@ -1288,8 +1418,8 @@ class Experiment():
                     probs_dis_after_i = probs_dis_after[index]
                     probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
                     probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
-                    KL_before_list.append(self.KL_divergence(bias_dis, probs_dis_before_i))
-                    KL_after_list.append(self.KL_divergence(bias_dis, probs_dis_after_i))
+                    KL_before_list.append(self.KL_divergence(probs_dis_before_i, bias_dis))
+                    KL_after_list.append(self.KL_divergence(probs_dis_after_i, bias_dis))
 
                 KL_before = round(np.mean(KL_before_list),5)
                 KL_after = round(np.mean(KL_after_list),5) 
@@ -1471,8 +1601,8 @@ class Experiment():
                     probs_dis_after_i = probs_dis_after[index]
                     probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
                     probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
-                    KL_before_list.append(self.KL_divergence(bias_distributions[i], probs_dis_before_i))
-                    KL_after_list.append(self.KL_divergence(bias_distributions[i], probs_dis_after_i))
+                    KL_before_list.append(self.KL_divergence(probs_dis_before_i, bias_distributions[i]))
+                    KL_after_list.append(self.KL_divergence(probs_dis_after_i, bias_distributions[i]))
 
                 KL_before = round(np.mean(KL_before_list),5)
                 KL_after = round(np.mean(KL_after_list),5) 
@@ -1530,7 +1660,7 @@ class Experiment():
         self.relations = lama_relations
         
 
-    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens",embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False):
+    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False):
         """Debiasing experiments for continue prompts.
 
         Args:
@@ -1658,8 +1788,8 @@ class Experiment():
                         probs_dis_after_i = probs_dis_after[index]
                         probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
                         probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
-                        KL_before_list.append(self.KL_divergence(bias_dis, probs_dis_before_i))
-                        KL_after_list.append(self.KL_divergence(bias_dis, probs_dis_after_i))
+                        KL_before_list.append(self.KL_divergence(probs_dis_before_i, bias_dis))
+                        KL_after_list.append(self.KL_divergence(probs_dis_after_i, bias_dis))
 
                     KL_before = round(np.mean(KL_before_list),5)
                     KL_after = round(np.mean(KL_after_list),5) 
@@ -1756,6 +1886,146 @@ class Experiment():
             self.plm.bert.embeddings.word_embeddings.weight = output_embedding_backup.weight
 
         pbar.close()
+
+
+    def quantify_prompt_bias(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", prompt="LAMA", meanless_word="[MASK]", sampling=False):
+        """Quantify the prompt bias with KL divergence and support set.
+        
+        This func will quantify the specific prompt bias of in current Model.
+
+        Args:
+            vocab_subset_filter (bool, optional): whether to limit the output vocabulary space of the model. Defaults to True.
+            vocab_subset (str, optional): A smaller vocab used to probe facts, it is the label space that we quantify the prompt bias. Defaults to "answer_type_tokens".
+            prompt (str, optional): The prompt used to probe facts. Can be "LAMA", "LPAQA", "AutoPrompt", "Optiprompt".
+        
+        Returns:
+            A tuple of (avg_raw_KL, avg_debias_KL, KL), where the KL denates to the detailed KL values for all relations.
+        """
+
+        # prepare the prompts
+        templates = None
+        if prompt=="LAMA":
+            templates = self.lama_template
+        elif prompt=="LPAQA":
+            templates = self.LPAQA_template
+        elif prompt=="AutoPrompt":
+            if self.model_name.startswith("roberta"):
+                templates = self.AutoPrompt_tempalte_roberta
+            elif self.model_name.startswith("bert"):
+                templates = self.AutoPrompt_template_bert
+            else:
+                raise ValueError(f"an invalid param: {self.model_name}")
+        elif prompt=="OptiPrompt":
+            # TODO 还需要进一步实现
+            templates = ""
+            pass
+        else:
+            raise ValueError(f"an invalid param: {prompt}")
+        
+        KL= {}
+        print(f"There are {len(self.relations)} relations needing to quantify prompt bias.")
+        for relation in self.relations:
+            # prepare raw WIKI-UNI
+            uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
+            raw_template =templates[relation]
+            if meanless_word=="[MASK]":
+                prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+            elif meanless_word=="N/A":
+                prompt_only_tempalte = raw_template.replace("[X]", "N/A").replace("[Y]", self.tokenizer.mask_token)
+            elif meanless_word=="":
+                prompt_only_tempalte = raw_template.replace("[X]", "").replace("[Y]", self.tokenizer.mask_token)
+
+            
+            subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
+                                                if vocab_subset == "answer_type_tokens" else \
+                                    self.get_common_vocab_indices(self.tokenizer)
+            subvocab_indices_list = subvocab_tokens_indices.tolist()
+
+            # wrap dataset
+            dataset = {}
+            first_token = raw_template.split()[0]
+            autoprompt_postfix = first_token[3:] if prompt=="AutoPrompt" else ''
+            raw_test_data, _ = self.load_data(uni_data_path, common_vocab=self.common_vocab)
+            # if len(raw_test_data) < self.support_dataset:
+            #     print("样本不足, 跳过该relation")
+            #     continue
+            dataset["test"] = self.wrap_input_examples(raw_test_data, self.tokenizer,autoprompt_postfix=autoprompt_postfix)
+
+            # transform to the template with OpenPrompt's format.
+            template = raw_template.replace(first_token,'{"placeholder":"text_a"}') if prompt=="AutoPrompt" else \
+                        raw_template.replace("[X]", '{"placeholder":"text_a"}')
+            template = template.replace("[Y]", '{"mask"}')
+            prompt_template = ManualTemplate(tokenizer=self.tokenizer, text=template)
+
+            # support dataset for sampling
+            support_sampler = FewShotSampler(num_examples_total=self.support_dataset, also_sample_dev=False)
+            dataset['support'] = support_sampler(dataset['test'], seed=6)
+            support_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=self.tokenizer,
+                tokenizer_wrapper_class=self.WrapperClass, max_seq_length=512,
+                batch_size=16, shuffle=False)
+            # bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
+
+            # prepare the model
+            promptModel = PromptModel(
+            template = prompt_template,
+            plm = self.plm,
+            freeze_plm=True
+            )
+
+            promptModel.cuda()
+            
+            # 打印测试精度
+            # test_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=self.tokenizer,
+            #     tokenizer_wrapper_class=self.WrapperClass, max_seq_length=512,
+            #     batch_size=16, shuffle=False)
+
+            # alllabels = []
+            # allpreds = []
+            # subvocab_tokens_indices = subvocab_tokens_indices.cuda()
+            # for inputs in test_dataloader:
+            #     inputs = inputs.cuda()
+            #     logits = promptModel(inputs).logits
+            #     mask_logits = logits[torch.where(inputs['loss_ids']>0)]
+            #     if subvocab_tokens_indices != None:
+            #         mask_logits = mask_logits.index_select(dim=1,index=subvocab_tokens_indices)
+                
+            #     labels = inputs["label"]
+            #     alllabels += labels.cpu().tolist()
+            #     predict_index = torch.argmax(mask_logits, dim=-1)
+            #     if subvocab_tokens_indices != None:
+            #         predict_index = subvocab_tokens_indices[predict_index]
+            #     allpreds.extend(predict_index.cpu().tolist())
+        
+            # acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
+            # print(acc)
+            # exit()
+
+
+            if not sampling:
+                bias_logits, bias_vector = self.get_manual_prompt_bias(self.plm, self.tokenizer, template=prompt_only_tempalte)
+            else:
+                bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
+
+
+            # 得到一个平均概率值
+            avg_probs,avg_probs_debias = self.get_probs_by_sample(promptModel, support_dataloader, subvocab_indices_list, bias_vector=bias_vector)
+            uniform_probs = torch.ones(avg_probs.shape)/avg_probs.shape[0]
+            avg_probs, avg_probs_debias, uniform_probs = avg_probs.tolist(), avg_probs_debias.tolist(), uniform_probs.tolist()
+
+            # 计算和均匀分布之间的距离
+            raw_KL = self.KL_divergence(avg_probs, uniform_probs)
+            debiased_KL = self.KL_divergence(avg_probs_debias, uniform_probs)
+            # print(f"raw_KL: {raw_KL}, debiased_KL {debiased_KL}")
+            #  dataset
+            KL[relation] = {"raw_KL":raw_KL, "debiased_KL":debiased_KL}
+            print("Finish relation {}, raw_KL:{}, debiased_KL:{}".format(relation, round(raw_KL,5), round(debiased_KL,5)))
+
+        avg_raw_KL = np.mean([value["raw_KL"] for value in KL.values()])
+        avg_debias_KL = np.mean([value["debiased_KL"] for value in KL.values()])
+
+        return avg_raw_KL, avg_debias_KL, KL
+
+        
 
 
     def wrap_input_examples(self, raw_dataset:list, tokenizer:PreTrainedTokenizer, autoprompt_postfix=""):
@@ -1973,23 +2243,30 @@ class Experiment():
         return acc, (probs, allpreds, alllabels)
 
 
-    def KL_divergence(self, dis_a:defaultdict, dis_b:defaultdict ):
+    def KL_divergence(self, dis_a, dis_b):
         """calculate the KL divergence between two distributions
 
         Args:
-            dis_a (defaultdict): distribution a as the denominator.
-            dis_b (defaultdict): distribution b.
+            dis_a ([defaultdict, list]): distribution a. The true obversed distribution.
+            dis_b ([defaultdict, list]): distribution b. The theoretical distribution.
 
         Returns:
             float: the KL divergence
         """
-        # 样本空间的所有点
-        keys = dis_a.keys()
-        KL = 0.0
-        for key in keys:
-            if dis_b[key]==0:
-                continue
-            KL += dis_b[key] * log(dis_b[key] / dis_a[key],2)
+        assert .0 not in dis_b and 0 not in dis_b, "distribution b should not containing zero!"
+        if isinstance(dis_a, defaultdict):
+            keys = dis_a.keys()
+            KL = 0.0
+            for key in keys:
+                if dis_a[key]==0:
+                    continue
+                KL += dis_a[key] * log(dis_a[key] / dis_b[key])
+        elif isinstance(dis_a, list):
+            KL = 0.0
+            for i in range(len(dis_a)):
+                if dis_a[i]==0:
+                    continue
+                KL += dis_a[i] * log(dis_a[i] / dis_b[i])
         
         return KL
 
@@ -2034,15 +2311,27 @@ class Experiment():
 
 if __name__ == '__main__':
     # An example
-    set_seed(7)
     exp = Experiment()
     output_dir = "./output/"
-    exp.set_model("bert","bert-base-cased")
-    exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
-    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA")
+    exp.set_model("roberta","roberta-large")
+    exp.relations = ["P20"]
+    exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
+    # exp.set_model("bert","bert-base-cased")
+    # # exp.relations = ["P140"]
+    # exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
+    raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA")
+    # print(f"LAMA: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
+    # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LPAQA")
+    # print(f"LPAQA: raw_KL: {raw_KL}
+    # , debias_KL: {debias_KL}")
+    # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA", meanless_word="[MASK]", sampling=False)
+    # print(f"AutoPrompt: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
+
+    
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA", ctrl_code=[1,0,1])
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
     # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
-    exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_sampling_debias.json")
-    exp.print_output()
-    exp.clear_output()
+    # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_sampling_debias.json")
+    # exp.print_output()
+    # exp.clear_output()

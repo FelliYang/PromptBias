@@ -4,7 +4,12 @@ INTER_VOCAB=${3:-common_vocab_cased}
 PROBE_METHOD=${4:-typed_querying}
 PROMPT=${5:-LAMA}
 CUDA_DEVICE=${6:-0}
-WORKSPACE=${7:-/mnt/code/users/xuziyang/PromptBias}
+DO_DEBIAS=${7:-True}
+EVAL_BIAS=${8:-False}
+SUPPORT_DATASET=${9:-200}
+
+WORKSPACE=/mnt/code/users/xuziyang/PromptBias
+
 
 export CUDA_VISIBLE_DEVICES=$CUDA_DEVICE
 
@@ -14,7 +19,15 @@ else
     TYPED_QUERYING=False
 fi
 
+
 LOG_DIR=${WORKSPACE}/logs/${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}
+
+if [ $DO_DEBIAS == True ]; then
+    LOG_NAME=${LOG_DIR}/${PROMPT}
+elif [ $EVAL_BIAS == True ]; then
+    LOG_NAME=${LOG_DIR}/${PROMPT}_eval_bias_${SUPPORT_DATASET}
+fi
+
 
 cd ${WORKSPACE}/code
 if [ ! -d "$LOG_DIR" ]; then
@@ -26,17 +39,25 @@ echo "python script.py \
     --model_type $MODEL_TYPE \
     --model_name $MODEL_NAME \
     --prompt ${PROMPT} \
+    --do_debias $DO_DEBIAS \
+    --eval_bias $EVAL_BIAS \
     --common_vocab ${INTER_VOCAB}.txt \
     --typed_querying $TYPED_QUERYING \
     --save_path ${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}/${PROMPT}_result.json \
-    > ${LOG_DIR}/${PROMPT}.log 2>&1 &"
+    --eval_output_path ${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}/${PROMPT}_eval_bias_${SUPPORT_DATASET}.json \
+    > $LOG_NAME.log 2>&1 &
+"
 
 
 python script.py \
     --model_type $MODEL_TYPE \
     --model_name $MODEL_NAME \
     --prompt ${PROMPT} \
+    --do_debias $DO_DEBIAS \
+    --eval_bias $EVAL_BIAS \
     --common_vocab ${INTER_VOCAB}.txt \
     --typed_querying $TYPED_QUERYING \
     --save_path ${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}/${PROMPT}_result.json \
-    > ${LOG_DIR}/${PROMPT}.log 2>&1 &
+    --eval_output_path ${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}/${PROMPT}_eval_bias${SUPPORT_DATASET}.json \
+    --support_dataset $SUPPORT_DATASET \
+    > $LOG_NAME.log 2>&1 &
