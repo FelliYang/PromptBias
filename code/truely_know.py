@@ -124,19 +124,24 @@ class Experiment():
         for model in self.output_result.keys():
             table = PrettyTable()
             table.title = model
-            table.field_names = ["Datasets",  "Prompts","P","P^d","KL","KL^d"]
+            table.field_names = ["Datasets",  "Prompts","P","P^d","KL","KL^d","TT_CE","TT_CE^d","FF_E","FF_E^d"]
             model_output = self.output_result[model]
             for dataset in model_output.keys():
-                table.add_row([dataset,"","","","",""])
+                table.add_row([dataset,"","","","","","","","",""])
                 dataset_output = model_output[dataset]
                 for prompt in dataset_output.keys():
                     prompt_output = dataset_output[prompt]
                     P,P_d,KL,KL_d = prompt_output['P'], prompt_output["P_d"], prompt_output["KL"], prompt_output["KL_d"]
+                    TT_CE, TT_CE_d, FF_E, FF_E_d = prompt_output["TT_CE"], prompt_output["TT_CE_d"], prompt_output["FF_E"], prompt_output["FF_E_d"]
                     P = math.floor(P *100 * 10+0.5)/10
                     P_d = math.floor(P_d *100 * 10+0.5)/10
                     KL = math.floor(KL * 10+0.5)/10
                     KL_d = math.floor(KL_d * 10+0.5)/10
-                    table.add_row(["",prompt,P,P_d,KL,KL_d])
+                    TT_CE= math.floor(TT_CE * 1000+0.5)/1000
+                    TT_CE_d= math.floor(TT_CE_d * 1000+0.5)/1000
+                    FF_E = math.floor(FF_E * 1000+0.5)/1000
+                    FF_E_d= math.floor(FF_E_d * 1000+0.5)/1000
+                    table.add_row(["",prompt,P,P_d,KL,KL_d, TT_CE, TT_CE_d, FF_E,FF_E_d])
             print(table)
                     
 
@@ -145,7 +150,8 @@ class Experiment():
             self.output_result[model] = {}
         if dataset not in self.output_result[model].keys():
             self.output_result[model][dataset] = {}
-        self.output_result[model][dataset][prompt] = {"P":result[0], "P_d":result[1], "KL":result[2], "KL_d":result[3]}
+        self.output_result[model][dataset][prompt] = {"P":result[0], "P_d":result[1], "KL":result[2], "KL_d":result[3], 
+                                                    "TT_CE":result[4], "TT_CE_d": result[5], "FF_E": result[6], "FF_E_d": result[7]}
     
 
     def load_data(self, data_path, common_vocab=None, filter_repeat=True, return_resample_weights=False, close_filter=False):
@@ -1157,6 +1163,9 @@ class Experiment():
                 model=plm, tokenizer=tokenizer, text=current_template)
 
             prompt_template.soft_embedding.weight.data.normal_(mean=0.0, std=model_config.initializer_range)
+        else:
+            print(f"invalid continue prompt paramters: {continue_prompt}")
+            exit(-1)
 
         # A pre-knowledge that all samples in our test datases are fewer than 64 tokens
         max_tokens_len = 64
@@ -1308,9 +1317,9 @@ class Experiment():
         total_diff = [[],[],[]]
         # save important metrics
         output_save = { 
-                        "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[]},
-                        "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[]},
-                        "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
+                        "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[], "TT_CE":[], "TT_CE_d":[], "FF_E":[], "FF_E_d":[]},
+                        "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[], "TT_CE":[], "TT_CE_d":[], "FF_E":[], "FF_E_d":[]},
+                        "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[], "TT_CE":[], "TT_CE_d":[], "FF_E":[], "FF_E_d":[]}
                       }
  
         # save all preds for further analysis
@@ -1396,9 +1405,46 @@ class Experiment():
                     prompt=manual_prompt,
                     sampling_debias=sampling_debias)
                 
+                subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
+                loss = torch.nn.CrossEntropyLoss()
+
+                equality_mask = torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & torch.eq(torch.tensor(preds_after), torch.tensor(labels))
+                common_acc_index =  torch.where(equality_mask==True)[0]
+                TT_CE_before = 0 if torch.numel(common_acc_index)==0 else loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
+                TT_CE_after = 0 if torch.numel(common_acc_index)==0 else loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
+                # print(f"TT CE before: {TT_CE_before} TT CE after {TT_CE_after}")
+                
+                equality_mask = ~torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & ~torch.eq(torch.tensor(preds_after), torch.tensor(labels))
+                common_acc_index =  torch.where(equality_mask==True)[0]
+                # 给定pred和labels, 计算得到分布
+
+                def convert_to_probability(predictions):
+                    total_predictions = len(predictions)
+                    unique_values, counts = np.unique(predictions, return_counts=True)
+                    probabilities = counts / total_predictions
+                    return probabilities
+
+                def entropy(probabilities):
+                    entropy_value = -np.sum(probabilities * np.log2(probabilities))
+                    return entropy_value
+
+                FF_E = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_before)[common_acc_index].tolist()))
+                FF_E_d = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_after)[common_acc_index].tolist()))
+                
+                # FF_CE_before = loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
+                # FF_CE_after = loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
+                # print(f"FF CE before: {FF_CE_before} FF CE after {FF_CE_after}")
+
                 dataset = list(output_save.keys())[i]
                 output_save[dataset]["P"].append(acc_origin)
                 output_save[dataset]["P_d"].append(acc_debias)
+
+                output_save[dataset]["TT_CE"].append(TT_CE_before)
+                output_save[dataset]["TT_CE_d"].append(TT_CE_after)
+
+                output_save[dataset]["FF_E"].append(FF_E)
+                output_save[dataset]["FF_E_d"].append(FF_E_d)
+                
                 
                 # save all preds
                 obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
@@ -1479,7 +1525,12 @@ class Experiment():
             avg_p_d = np.mean(output_save[dataset]["P_d"])
             avg_KL = np.mean(output_save[dataset]["KL"])
             avg_KL_d = np.mean(output_save[dataset]["KL_d"])
-            self.add_output_item(self.model_name, dataset,prompt=manual_prompt,result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+            avg_TT_CE = np.mean(output_save[dataset]["TT_CE"])
+            avg_TT_CE_d = np.mean(output_save[dataset]["TT_CE_d"])
+            avg_FF_E = np.mean(output_save[dataset]["FF_E"])
+            avg_FF_E_d = np.mean(output_save[dataset]["FF_E_d"])
+            
+            self.add_output_item(self.model_name, dataset,prompt=manual_prompt,result=[avg_p,avg_p_d,avg_KL,avg_KL_d,avg_TT_CE,avg_TT_CE_d,avg_FF_E,avg_FF_E_d])
         
         self.print_output()
 
@@ -1702,7 +1753,7 @@ class Experiment():
             else:
                 save_dir += "origin_embedding"
             
-            save_dir += f"/exp_{index}"
+            save_dir += f"/exp_{_index}"
             
             dataset_names = ["lama","uni","lama_whu"]
             dataset_num = len(ctrl_code)
@@ -1718,9 +1769,9 @@ class Experiment():
             total_diff = [[],[],[]]
             # svae metrics
             output_save = { 
-                            "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[]},
-                            "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[]},
-                            "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[]}
+                            "LAMA": {"P":[], "P_d":[],"KL":[], "KL_d":[], "TT_CE":[], "TT_CE_d":[], "FF_E":[], "FF_E_d":[]},
+                            "WIKI-UNI":{"P":[], "P_d":[],"KL":[], "KL_d":[], "TT_CE":[], "TT_CE_d":[], "FF_E":[], "FF_E_d":[]},
+                            "LAMA-WHU":{"P":[], "P_d":[],"KL":[], "KL_d":[], "TT_CE":[], "TT_CE_d":[], "FF_E":[], "FF_E_d":[]}
                         }
 
             # svae all predicts
@@ -1768,6 +1819,40 @@ class Experiment():
                     dataset = list(output_save.keys())[i]
                     output_save[dataset]["P"].append(acc_origin)
                     output_save[dataset]["P_d"].append(acc_debias)
+
+                    # 添加TT_CE 和FF_E
+                    subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
+                    loss = torch.nn.CrossEntropyLoss()
+
+                    equality_mask = torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & torch.eq(torch.tensor(preds_after), torch.tensor(labels))
+                    common_acc_index =  torch.where(equality_mask==True)[0]
+                    TT_CE_before = 0 if torch.numel(common_acc_index)==0 else loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
+                    TT_CE_after = 0 if torch.numel(common_acc_index)==0 else loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
+                    # print(f"TT CE before: {TT_CE_before} TT CE after {TT_CE_after}")
+                    
+                    equality_mask = ~torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & ~torch.eq(torch.tensor(preds_after), torch.tensor(labels))
+                    common_acc_index =  torch.where(equality_mask==True)[0]
+                    # 给定pred和labels, 计算得到分布
+
+                    def convert_to_probability(predictions):
+                        total_predictions = len(predictions)
+                        unique_values, counts = np.unique(predictions, return_counts=True)
+                        probabilities = counts / total_predictions
+                        return probabilities
+
+                    def entropy(probabilities):
+                        entropy_value = -np.sum(probabilities * np.log2(probabilities))
+                        return entropy_value
+
+                    FF_E = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_before)[common_acc_index].tolist()))
+                    FF_E_d = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_after)[common_acc_index].tolist()))
+
+                    output_save[dataset]["TT_CE"].append(TT_CE_before)
+                    output_save[dataset]["TT_CE_d"].append(TT_CE_after)
+
+                    output_save[dataset]["FF_E"].append(FF_E)
+                    output_save[dataset]["FF_E_d"].append(FF_E_d)
+
 
                     # 保存preds结果
                     obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
@@ -1852,9 +1937,15 @@ class Experiment():
                 avg_p_d = np.mean(output_save[dataset]["P_d"])
                 avg_KL = np.mean(output_save[dataset]["KL"])
                 avg_KL_d = np.mean(output_save[dataset]["KL_d"])
-                self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+                avg_TT_CE = np.mean(output_save[dataset]["TT_CE"])
+                avg_TT_CE_d = np.mean(output_save[dataset]["TT_CE_d"])
+                avg_FF_E = np.mean(output_save[dataset]["FF_E"])
+                avg_FF_E_d = np.mean(output_save[dataset]["FF_E_d"])
+
+                self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d,avg_TT_CE,avg_TT_CE_d,avg_FF_E,avg_FF_E_d])
             
             self.save_output(os.path.join(root_dir, save_dir+"/result.json"))
+            self.print_output()
             temp = copy.copy(self.output_result)
             output_results.append(temp)
 
@@ -1871,11 +1962,21 @@ class Experiment():
             P_d = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["P_d"] for result in output_results]
             KL = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["KL"] for result in output_results]
             KL_d = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["KL_d"] for result in output_results]
+            TT_CE = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["TT_CE"] for result in output_results]
+            TT_CE_d = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["TT_CE_d"] for result in output_results]
+            FF_E = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["FF_E"] for result in output_results]
+            FF_E_d = [result[self.model_name][dataset][continue_prompt+'_'+str(num_tokens)]["FF_E_d"] for result in output_results]
+            
             avg_p = np.mean(P)
             avg_p_d = np.mean(P_d)
             avg_KL = np.mean(KL)
             avg_KL_d = np.mean(KL_d)
-            self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d])
+            avg_TT_CE = np.mean(TT_CE)
+            avg_TT_CE_d = np.mean(TT_CE_d)
+            avg_FF_E = np.mean(FF_E)
+            avg_FF_E_d = np.mean(FF_E_d)
+
+            self.add_output_item(self.model_name, dataset,prompt=continue_prompt+'_'+str(num_tokens),result=[avg_p,avg_p_d,avg_KL,avg_KL_d,avg_TT_CE,avg_TT_CE_d,avg_FF_E,avg_FF_E_d])
 
         torch.save(preds_save,preds_save_path)
 
@@ -2313,13 +2414,13 @@ if __name__ == '__main__':
     # An example
     exp = Experiment()
     output_dir = "./output/"
-    exp.set_model("roberta","roberta-large")
-    exp.relations = ["P20"]
-    exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
+    exp.set_model("bert","bert-base-cased")
+    # exp.relations = ["P413"]
+    exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     # exp.set_model("bert","bert-base-cased")
     # # exp.relations = ["P140"]
     # exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
-    raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA")
+    # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA")
     # print(f"LAMA: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
     # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LPAQA")
     # print(f"LPAQA: raw_KL: {raw_KL}
@@ -2328,10 +2429,10 @@ if __name__ == '__main__':
     # print(f"AutoPrompt: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
 
     
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA", ctrl_code=[1,0,1])
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA", ctrl_code=[1,0,0])
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5)
+    exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5,evaluate_mode=True, repeat_times=3)
     # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_sampling_debias.json")
     # exp.print_output()
     # exp.clear_output()
