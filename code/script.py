@@ -18,6 +18,7 @@ parser.add_argument('--sampling_debias', type=str, default="False")
 parser.add_argument('--save_path', type=str, default="none")
 parser.add_argument('--typed_querying', type=str, default="True")
 parser.add_argument("--do_debias", type=str, default="True")
+parser.add_argument("--do_calibrate", type=str, default="False")
 parser.add_argument("--eval_bias", type=str, default="False")
 parser.add_argument("--eval_output_path", type=str, default="none")
 parser.add_argument("--support_dataset", type=int, default=200)
@@ -29,6 +30,7 @@ args.evaluate_mode = eval(args.evaluate_mode)
 args.sampling_debias = eval(args.sampling_debias)
 args.typed_querying = eval(args.typed_querying)
 args.do_debias = eval(args.do_debias)
+args.do_calibrate = eval(args.do_calibrate)
 args.eval_bias = eval(args.eval_bias)
 
 
@@ -47,7 +49,7 @@ if args.do_debias:
     exp.set_model(args.model_type, args.model_name)
     exp.set_common_vocab(os.path.join(exp.work_dir, "common_vocabs", args.common_vocab))
     if args.prompt in manual_prompts:
-        exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt=args.prompt, vocab_subset=vocab_subset, sampling_debias=args.sampling_debias)
+        exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt=args.prompt, vocab_subset=vocab_subset, sampling_debias=args.sampling_debias, calibrate=args.do_calibrate)
     else:
         exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt=args.prompt, vocab_subset=vocab_subset, repeat_times=args.repeat_times,evaluate_mode=args.evaluate_mode)
     exp.print_output()

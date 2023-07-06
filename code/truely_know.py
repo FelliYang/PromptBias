@@ -842,7 +842,7 @@ class Experiment():
         return all_logits    
 
 
-    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,  embeddings_renormalize=False, prompt="LAMA", sampling_debias=False):
+    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,  embeddings_renormalize=False, prompt="LAMA", sampling_debias=False, calibrate=False):
         """Probe factual knowledge in the model with a manual prompt.
 
         Args:
@@ -956,8 +956,9 @@ class Experiment():
                 batch_size=16, shuffle=False)
             bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
         
+        cc_logits = torch.norm(bias_vector)*bias_logits
         if debias:
-            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices)
+            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices, calibrate=calibrate, calib_logits=cc_logits)
         else:
             acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
 
@@ -1268,7 +1269,7 @@ class Experiment():
         return model_bias_output, results
             
     
-    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False):
+    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False, calibrate=False):
         """Debiasing experiments for manual prompts. 
 
         Args:
@@ -1295,8 +1296,12 @@ class Experiment():
             self.plm.bert.embeddings.word_embeddings.weight = renormal.weight
             
         root_dir = self.work_dir + f"/outputs/openprompt/manual_prompt/{self.model_name}"
-
-        save_dir = f"{manual_prompt}/debias_{vocab_subset}/"
+        
+        if calibrate:
+            save_dir = f"{manual_prompt}/calibrate_{vocab_subset}/"
+        else:
+            save_dir = f"{manual_prompt}/debias_{vocab_subset}/"
+        
         if embeddings_renormalize==True:
             save_dir += "renormalize_embedding"
         else:
@@ -1403,15 +1408,34 @@ class Experiment():
                     vocab_subset=vocab_subset,
                     test_data_path=data_paths[i],
                     prompt=manual_prompt,
-                    sampling_debias=sampling_debias)
+                    sampling_debias=sampling_debias,
+                    calibrate=calibrate)
                 
                 subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
                 loss = torch.nn.CrossEntropyLoss()
 
                 equality_mask = torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & torch.eq(torch.tensor(preds_after), torch.tensor(labels))
                 common_acc_index =  torch.where(equality_mask==True)[0]
-                TT_CE_before = 0 if torch.numel(common_acc_index)==0 else loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
-                TT_CE_after = 0 if torch.numel(common_acc_index)==0 else loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
+
+                def cross_entropy(logits, labels):
+                    loss_per_sample = F.cross_entropy(logits, labels, reduction='none')
+                    loss_dict = {}
+                    for label,loss in zip(labels.tolist(), loss_per_sample.tolist()):
+                        if label in loss_dict:
+                            loss_dict[label].append(loss)
+                        else:
+                            loss_dict[label] = [loss]
+                    loss_list = []
+                    for key in loss_dict.keys():
+                        loss_list.append(np.mean(loss_dict[key]))
+                    
+                    return np.mean(loss_list)
+
+                TT_CE_before = 0 if torch.numel(common_acc_index)==0 else cross_entropy(probs_before[common_acc_index], subvocab_labels[common_acc_index])
+                TT_CE_after = 0 if torch.numel(common_acc_index)==0 else cross_entropy(probs_after[common_acc_index], subvocab_labels[common_acc_index])
+                # TT_CE_before = cross_entropy(probs_before, subvocab_labels)
+                # TT_CE_after = cross_entropy(probs_after, subvocab_labels)
+                # print(TT_CE_before, TT_CE_after)
                 # print(f"TT CE before: {TT_CE_before} TT CE after {TT_CE_after}")
                 
                 equality_mask = ~torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & ~torch.eq(torch.tensor(preds_after), torch.tensor(labels))
@@ -1430,6 +1454,8 @@ class Experiment():
 
                 FF_E = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_before)[common_acc_index].tolist()))
                 FF_E_d = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_after)[common_acc_index].tolist()))
+                # FF_E = entropy(convert_to_probability(preds_before))
+                # FF_E_d = entropy(convert_to_probability(preds_after))
                 
                 # FF_CE_before = loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
                 # FF_CE_after = loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
@@ -1823,11 +1849,28 @@ class Experiment():
                     # 添加TT_CE 和FF_E
                     subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
                     loss = torch.nn.CrossEntropyLoss()
+                    
+                    
+                    def cross_entropy(logits, labels):
+                        loss_per_sample = F.cross_entropy(logits, labels, reduction='none')
+                        loss_dict = {}
+                        for label,loss in zip(labels.tolist(), loss_per_sample.tolist()):
+                            if label in loss_dict:
+                                loss_dict[label].append(loss)
+                            else:
+                                loss_dict[label] = [loss]
+                        loss_list = []
+                        for key in loss_dict.keys():
+                            loss_list.append(np.mean(loss_dict[key]))
+                        
+                        return np.mean(loss_list)
 
                     equality_mask = torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & torch.eq(torch.tensor(preds_after), torch.tensor(labels))
                     common_acc_index =  torch.where(equality_mask==True)[0]
                     TT_CE_before = 0 if torch.numel(common_acc_index)==0 else loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
                     TT_CE_after = 0 if torch.numel(common_acc_index)==0 else loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
+                    # TT_CE_before = cross_entropy(probs_before, subvocab_labels)
+                    # TT_CE_after = cross_entropy(probs_after, subvocab_labels)
                     # print(f"TT CE before: {TT_CE_before} TT CE after {TT_CE_after}")
                     
                     equality_mask = ~torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & ~torch.eq(torch.tensor(preds_after), torch.tensor(labels))
@@ -1846,6 +1889,8 @@ class Experiment():
 
                     FF_E = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_before)[common_acc_index].tolist()))
                     FF_E_d = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_after)[common_acc_index].tolist()))
+                    # FF_E = entropy(convert_to_probability(preds_before))
+                    # FF_E_d = entropy(convert_to_probability(preds_after))
 
                     output_save[dataset]["TT_CE"].append(TT_CE_before)
                     output_save[dataset]["TT_CE_d"].append(TT_CE_after)
@@ -2179,7 +2224,7 @@ class Experiment():
                 vocab_subset_indices=None,
                 soft_tempalte_ckpt=None, 
                 continue_prompt="prefix",num_tokens=5,
-                calibration=False, calib_logits=None):
+                calibrate=False, calib_logits=None):
         """Evaluate the raw or debiased acc in a dataset.
 
         Args:
@@ -2192,8 +2237,8 @@ class Experiment():
             soft_tempalte_ckpt (str, optional): the saved weights of the continue prompt. Defaults to None.
             continue_prompt (str, optional): type of the continue prompt to use. Defaults to "prefix".
             num_tokens (int, optional): the number of the soft tokens in the continue prompt. Defaults to 5.
-            calibration (bool, optional): use calibration rather our debiasing method to mitigate prompt. Defaults to False.
-            calib_logits (tensor, optional): the calibration logits. Defaults to None.
+            calibrate (bool, optional): use calibrate rather our debiasing method to mitigate prompt. Defaults to False.
+            calib_logits (tensor, optional): the calibrate logits. Defaults to None.
 
         Returns:
             tuple: a tuple of (acc, (probs, allpreds, alllabels))
@@ -2235,10 +2280,11 @@ class Experiment():
             if bias_logits!=None:
                 bias_logits = bias_logits.index_select(index=vocab_subset_indices,dim=0)
 
-        # calibration 需要对verbalizer操作一下
-        if calibration:
+        # calibrate 需要对verbalizer操作一下
+        if calibrate:
             if isinstance(promptModel, PromptForClassification):
                 promptModel.verbalizer.register_calibrate_logits(calib_logits)
+                
 
         for step, inputs in enumerate(data_loader):
             inputs =  inputs.cuda()
@@ -2259,21 +2305,37 @@ class Experiment():
                         # linear层之后的特征向量, 论文理论框架中用于debias的向量
                         prediction_vectors = mask_token_features
 
-                        batched_debiased_logits = None
-                        D_T = bias_vector / torch.norm(bias_vector)
-                        for i in range(mask_token_features.shape[0]):
-                            D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i])
-                            D_debias = (D_Tx - D_T) / torch.norm(D_Tx - D_T)
-                            V_debias = D_debias * torch.norm(mask_token_features[i])
-                            debiased_logits = decoder(V_debias).unsqueeze(dim=0)
-                            if batched_debiased_logits == None:
-                                batched_debiased_logits = debiased_logits
-                            else:
-                                batched_debiased_logits = torch.cat((batched_debiased_logits,debiased_logits),dim=0)
-                        
-                        mask_logits = batched_debiased_logits
-                        if vocab_subset_indices != None:
-                            mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
+
+                        if calibrate:
+                            mask_logits = decoder(prediction_vectors)
+                            assert len(mask_logits.shape)==2
+                            if vocab_subset_indices != None:
+                                mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
+                            # 手动实现calibrate
+                            calib_logits = calib_logits.to(mask_logits.device)
+                            calib_logits_answer_space = calib_logits.index_select(dim=0,index=vocab_subset_indices)
+                            calib_probs = torch.softmax(calib_logits_answer_space,dim=0)
+                            mask_probs = torch.softmax(mask_logits, dim=1)
+                            mask_probs -= calib_probs
+                            # normalize
+                            mask_probs = (mask_probs.T / torch.sum(mask_probs, dim=1)).T
+                            mask_logits = torch.log(mask_probs)
+                        else:
+                            batched_debiased_logits = None
+                            D_T = bias_vector / torch.norm(bias_vector)
+                            for i in range(mask_token_features.shape[0]):
+                                D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i])
+                                D_debias = (D_Tx - D_T) / torch.norm(D_Tx - D_T)
+                                V_debias = D_debias * torch.norm(mask_token_features[i])
+                                debiased_logits = decoder(V_debias).unsqueeze(dim=0)
+                                if batched_debiased_logits == None:
+                                    batched_debiased_logits = debiased_logits
+                                else:
+                                    batched_debiased_logits = torch.cat((batched_debiased_logits,debiased_logits),dim=0)
+                            
+                            mask_logits = batched_debiased_logits
+                            if vocab_subset_indices != None:
+                                mask_logits = mask_logits.index_select(dim=1,index=vocab_subset_indices)
                             
                     elif isinstance(promptModel, PromptForClassification):
                         # 一定有verbalizer 來做分类
@@ -2337,8 +2399,8 @@ class Experiment():
         
         acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
        
-        # calibration 副作用需要手动恢复
-        if calibration:
+        # calibrate 副作用需要手动恢复
+        if calibrate and isinstance(promptModel, PromptForClassification):
             promptModel.verbalizer._calibrate_logits = None
         # allpreds and alllabels are indice of the raw dataset
         return acc, (probs, allpreds, alllabels)
@@ -2427,12 +2489,12 @@ if __name__ == '__main__':
     # , debias_KL: {debias_KL}")
     # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA", meanless_word="[MASK]", sampling=False)
     # print(f"AutoPrompt: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
-
+    # exp.relations=["P138"]
     
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LAMA", ctrl_code=[1,0,0])
+    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt", ctrl_code=[1,1,1], calibrate=False)
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-    exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5,evaluate_mode=True, repeat_times=3)
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5,evaluate_mode=True, repeat_times=3)
     # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_sampling_debias.json")
     # exp.print_output()
     # exp.clear_output()
