@@ -427,7 +427,7 @@ class Experiment():
                 we will take the index of first `[MASK]` token found reversely as the y_mask_index. 
 
         Returns:
-            tuple : a tuple of (bias_logits, bias_features). `bias_logits` refers to the normalized bias vector
+            tuple : a tuple of (bias_logits, bias_features). `bias_logits` refers to the normalized bias logits
                 `bias_features` refers to the raw bias vector.
         """
 
@@ -482,7 +482,7 @@ class Experiment():
         return bias_logits, bias_features    
 
 
-    def get_continue_prompt_bias(self, promptModel, prompt_template, continue_prompt, ckpt_path=None, num_tokens=0):
+    def get_continue_prompt_bias(self, promptModel, prompt_template, continue_prompt:str, ckpt_path=None, num_tokens=0):
         """Generate the model bias tensor used to debias. Used only for Openprompt continue prompts.
 
         Args:
@@ -516,7 +516,7 @@ class Experiment():
             soft_embeds = torch.load(ckpt_path)
             if continue_prompt=="prefix":
                 promptModel.template.soft_embeds.data.copy_(soft_embeds)
-            elif continue_prompt=="optiprompt":
+            elif continue_prompt.lower()=="optiprompt":
                 promptModel.template.soft_embedding.weight.data.copy_(soft_embeds)
 
         template_only = [{"sub_label":self.tokenizer.mask_token,"obj_label":"no"}]
@@ -1269,6 +1269,144 @@ class Experiment():
         return model_bias_output, results
             
     
+    def experiment_prompt_only_accuracy(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", ctrl_code=[1,1,1] , prompt="LAMA",num_tokens=5, do_sample=False):
+        """This exp is used to show how much the LAMA dataset and WIKI-UNI dataset benefit from prompt bias.
+
+        We first get the prompt bias distribution, then based on the distribution to choose the answer for specified strategy. 
+
+        Args:
+            vocab_subset_filter (bool, optional): whether to limit the output vocabulary space of the model. Defaults to True.
+            vocab_subset (str, optional): A smaller vocab used to probe facts. Defaults to "answer_type_tokens".
+            ctrl_code (list, optional): which datasets are used in this exp. Defaults to [1,1,1], representing use all three datasets [lama, wiki-uni, lama_whu].
+            prompt (str, optional): The prompt series used in exp. Defaults to "LAMA". Could also be "LPAQA", "AutoPrompt", "OptiPrompt"
+            do_sample (bool, optional): sample from the output distribution probabilities to choose the final token. Defaults to False.
+        """
+
+        # save important metrics
+        output_save = { 
+                "LAMA": {"P":[], },
+                "WIKI-UNI":{"P":[]},
+                "LAMA-WHU":{"P":[]}
+                }
+
+        # choose the right prompts
+        IsContinuePrompt = False
+        templates = None
+        if prompt=="LAMA":
+            templates = self.lama_template
+        elif prompt=="LPAQA":
+            templates = self.LPAQA_template
+        elif prompt=="AutoPrompt":
+            if self.model_name.startswith("roberta"):
+                templates = self.AutoPrompt_tempalte_roberta
+            elif self.model_name.startswith("bert"):
+                templates = self.AutoPrompt_template_bert
+            else:
+                raise ValueError(f"an invalid param: {self.model_name}")
+        elif prompt=="OptiPrompt":
+            IsContinuePrompt=True
+            current_template = '{"placeholder":"text_a"} '
+            current_template += '{"soft":None,"duplicate":' + str(num_tokens) + '}'
+            current_template += '{"mask"} .'
+            prompt_template = MixedTemplate(
+                model=self.plm, tokenizer=self.tokenizer, text=current_template)
+            prompt_template.soft_embedding.weight.data.normal_(mean=0.0, std=self.model_config.initializer_range)
+        else:
+            raise ValueError(f"an invalid param: {prompt}")
+        
+        pbar = tqdm(total=len(self.relations)*sum(ctrl_code))
+
+        # start 
+        for relation in self.relations:
+            lama_data_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
+            uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
+            lama_whu_data_path = os.path.join(self.lama_whu_data_dir,f"{relation}.jsonl")
+            data_paths = [lama_data_path,uni_data_path,lama_whu_data_path]
+
+            if IsContinuePrompt:
+                promptModel = PromptModel(
+                    template = prompt_template,
+                    plm = self.plm,
+                    freeze_plm=True
+                    
+                )
+                promptModel.cuda()
+                root_dir = self.work_dir + f"/outputs/openprompt/continue_prompt/{self.model_name}"
+                # use the exp1 weights
+                save_dir = "optiprompt"+f"_{num_tokens}" + f"/debias_{vocab_subset}/"
+                save_dir += "origin_embedding"
+                save_dir += f"/exp_1"
+                best_ckpt = os.path.join(os.path.join(root_dir, save_dir), f"weight_save/{relation}/model_full-prompt_random_init.ckpt")
+                model_bias_output, bias_logits, bias_vector = self.get_continue_prompt_bias(promptModel, prompt_template, prompt, best_ckpt, num_tokens)
+            else:
+                raw_template =templates[relation]
+                prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+                bias_logits, bias_vector = self.get_manual_prompt_bias(self.plm, self.tokenizer, template=prompt_only_tempalte)
+            
+            origin_logits = (torch.norm(bias_vector)*bias_logits).cpu()
+            
+            # filter out logits with vocab_subset
+            subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
+                                                if vocab_subset == "answer_type_tokens" else \
+                                            self.get_common_vocab_indices(self.tokenizer)
+            
+            filtered_logits = origin_logits.index_select(dim=0, index=subvocab_tokens_indices)
+            prompt_only_probs = torch.softmax(filtered_logits, dim=0)
+
+            def make_prediction(probs:torch.Tensor, indice:torch.Tensor, do_sample=False, num=1, seed=2023):
+                """make prediciton based on prompt only probs and sample strategy
+
+                return: a token id
+                """
+                if do_sample==False:
+                    # always selected the max id
+                    index = torch.argmax(probs)
+                    id = indice[index].item()
+                    return [id]*num
+                else:
+                    # sample the target index according to probs
+                    probs = np.array(probs.tolist())
+                    probs /= probs.sum()
+                    np.random.seed(seed)
+                    index = np.random.choice(probs.shape[0],num, p=probs)
+                    id = indice[index]
+                    return id.tolist()
+            
+            # prepare dataset
+
+            # sample output and compare with the labels
+
+            for i,data_path in enumerate(data_paths):
+                dataset = list(output_save.keys())[i]
+                labels = []
+                raw_test_data, _ = self.load_data(data_path, common_vocab=self.common_vocab,)
+                for data_item in raw_test_data:
+                    # 加入空格，使得roberta生效
+                    obj_token = self.tokenizer.tokenize(' ' + data_item["obj_label"])[0]
+                    label = self.tokenizer.convert_tokens_to_ids(obj_token)
+                    labels.append(label)
+                
+                preds = make_prediction(prompt_only_probs, subvocab_tokens_indices, num=len(labels), do_sample=do_sample)
+                
+                acc = sum([int(i==j) for i,j in zip(preds, labels)])/len(preds)
+                output_save[dataset]["P"].append({relation:acc})
+                pbar.update(1)
+
+
+        # calculate average accuracy
+        avg_accuracy = {
+            "LAMA": 0,
+            "WIKI-UNI":0,
+            "LAMA-WHU":0
+        }
+
+        for dataset in output_save.keys():
+            all_acc = [list(item.values())[0] for item in output_save[dataset]["P"]] 
+            avg_accuracy[dataset] = np.mean(all_acc)
+        
+        return output_save, avg_accuracy
+
+
     def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False, calibrate=False):
         """Debiasing experiments for manual prompts. 
 
@@ -2169,9 +2307,7 @@ class Experiment():
         avg_raw_KL = np.mean([value["raw_KL"] for value in KL.values()])
         avg_debias_KL = np.mean([value["debiased_KL"] for value in KL.values()])
 
-        return avg_raw_KL, avg_debias_KL, KL
-
-        
+        return avg_raw_KL, avg_debias_KL, KL  
 
 
     def wrap_input_examples(self, raw_dataset:list, tokenizer:PreTrainedTokenizer, autoprompt_postfix=""):
@@ -2490,8 +2626,11 @@ if __name__ == '__main__':
     # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA", meanless_word="[MASK]", sampling=False)
     # print(f"AutoPrompt: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
     # exp.relations=["P138"]
-    
-    exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt", ctrl_code=[1,1,1], calibrate=False)
+    # exp.relations = ["P463"]
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(evaluate_mode=True, repeat_times=1)
+    output = exp.experiment_prompt_only_accuracy(prompt="OptiPrompt",do_sample=True)
+    print(output[1])
+    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt", ctrl_code=[1,1,1], calibrate=False)
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
     # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
     # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5,evaluate_mode=True, repeat_times=3)
