@@ -1,7 +1,8 @@
 # output dir
 outputs/
 output/
-analysis/
+code/analysis/*
+!code/analysis/*.ipynb
 results/
 # temp dir
 temp/
