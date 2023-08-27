@@ -7,6 +7,7 @@ CUDA_DEVICE=${6:-0}
 DO_DEBIAS=${7:-True}
 EVAL_BIAS=${8:-False}
 SUPPORT_DATASET=${9:-200}
+FILTER_OUT_BIASED_TOKEN=${10:-0}
 
 WORKSPACE=/mnt/code/users/xuziyang/PromptBias
 
@@ -26,7 +27,7 @@ else
 fi
 
 
-LOG_DIR=${WORKSPACE}/logs/${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}
+LOG_DIR=${WORKSPACE}/logs/filter_out_${FILTER_OUT_BIASED_TOKEN}_biased_tokens/${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}
 
 if [ $DO_DEBIAS == True ]; then
     LOG_NAME=${LOG_DIR}/${PROMPT}
@@ -60,6 +61,7 @@ echo "python script.py \
     --save_path $SAVE_PATH \
     --eval_output_path ${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}/${PROMPT}_eval_bias_${SUPPORT_DATASET}.json \
     --do_calibrate $DO_CALIBRATE \
+    --filter_biased_token_nums $FILTER_OUT_BIASED_TOKEN \
     > $LOG_NAME.log 2>&1 &
 "
 
@@ -76,4 +78,5 @@ python script.py \
     --eval_output_path ${MODEL_NAME}/${INTER_VOCAB}/${PROBE_METHOD}/${PROMPT}_eval_bias${SUPPORT_DATASET}.json \
     --support_dataset $SUPPORT_DATASET \
     --do_calibrate $DO_CALIBRATE \
+    --filter_biased_token_nums $FILTER_OUT_BIASED_TOKEN \
     > $LOG_NAME.log 2>&1 &

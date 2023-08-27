@@ -154,7 +154,7 @@ class Experiment():
                                                     "TT_CE":result[4], "TT_CE_d": result[5], "FF_E": result[6], "FF_E_d": result[7]}
     
 
-    def load_data(self, data_path, common_vocab=None, filter_repeat=True, return_resample_weights=False, close_filter=False):
+    def load_data(self, data_path, common_vocab=None, filter_repeat=True, filter_out_tokens=[], return_resample_weights=False, close_filter=False):
         """load and preprocess a dataset. 
         
         The raw dataset is assumed to be a .jsonl or .json file, with data items <sub_label, relation, obj_label>.
@@ -163,6 +163,7 @@ class Experiment():
             data_path (str): path of the dataset that will be loaded in.
             common_vocab (list, optional): . Defaults to None.
             filter_repeat (bool, optional): whether to filter out repeat data items. Defaults to True.
+            filter_out_tokens (list, optional): Forcefully filter out data with labels present in this list.
             return_resample_weights (bool, optional): whether to return a resample weights, which can be used to avoid a extreme label distribution in training. Defaults to False.
             close_filter (bool, optional): whether to close all filters
 
@@ -190,8 +191,19 @@ class Experiment():
         if not close_filter and common_vocab:
             current_len = len(data)
             data = list(filter(lambda x: x["obj_label"] in common_vocab, data))
-            print("filter out {} items since the vocab_subset".format(current_len - len(data)))
+            print("filter out {} items not in the vocab_subset".format(current_len - len(data)))
         
+        # filter out obj_label that in the filter_out_tokens list
+        def _token_to_id(x):
+            # 加入空格，使得roberta生效
+            obj_token = self.tokenizer.tokenize(' ' + x)[0]
+            id = self.tokenizer.convert_tokens_to_ids(obj_token)
+            return id
+
+        if not close_filter and (filter_out_tokens != []):
+            current_len = len(data)
+            data = list(filter(lambda x: _token_to_id(x["obj_label"]) not in filter_out_tokens, data))
+            print("filter out {} items belong to the top {} prompt biased token(s)".format(current_len - len(data), len(filter_out_tokens)))
 
         # filter out repeat data items
         if not close_filter and filter_repeat:
@@ -842,7 +854,7 @@ class Experiment():
         return all_logits    
 
 
-    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,  embeddings_renormalize=False, prompt="LAMA", sampling_debias=False, calibrate=False):
+    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,  embeddings_renormalize=False, prompt="LAMA", sampling_debias=False, calibrate=False, filter_biased_token_nums=0):
         """Probe factual knowledge in the model with a manual prompt.
 
         Args:
@@ -854,6 +866,8 @@ class Experiment():
             embeddings_renormalize (bool, optional): Whether to renormalize the embeddings of the model before probing. Defaults to False.
             prompt (str, optional): The prompt series used in probing. Defaults to "LAMA". Could also be "LPAQA", "AutoPrompt".
             sampling_debias (str, optional): Whether to use sampling debiasing strategy to mitigate the prompt bias.
+            filter_biased_token_nums (int, optional): A filtered applied to the dataset to filter out the current prompt biased data. 
+                Default to 0 that do not filter out any data. Set it to 1 means filtering out data prompt biased mostly from the dataset.
 
         Raises:
             ValueError: when `vocab_subset` is set to an invalid value.
@@ -919,9 +933,6 @@ class Experiment():
         # there is a postfix after [X]. 
         first_token = raw_template.split()[0]
         autoprompt_postfix = first_token[3:] if prompt=="AutoPrompt" else ''
-        raw_test_data, _ = self.load_data(test_data_path, common_vocab=self.common_vocab,)
-        dataset["test"] = self.wrap_input_examples(raw_test_data, tokenizer,autoprompt_postfix=autoprompt_postfix)
-        sub_labels = [d["sub_label"] for d in raw_test_data]
 
         # transform to the template with OpenPrompt's format.
         template = raw_template.replace(first_token,'{"placeholder":"text_a"}') if prompt=="AutoPrompt" else \
@@ -933,34 +944,61 @@ class Experiment():
         prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
         bias_logits, bias_vector = self.get_manual_prompt_bias(model,tokenizer, template=prompt_only_tempalte)
 
-        # get the max pad number in dataset
-        max_tokens_len = self.compute_max_pad(dataset, WrapperClass, tokenizer, prompt_template)
-        # Note: Do not shuffle!
-        test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=tokenizer,
-            tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
-            batch_size=16,shuffle=False)
-        
-        promptModel = PromptModel(
-            template = prompt_template,
-            plm = plm,
-            freeze_plm=True
-        )
-        promptModel.cuda()
-        
-        if sampling_debias==True:
-            # support dataset for sampling
-            support_sampler = FewShotSampler(num_examples_total=200, also_sample_dev=False)
-            dataset['support'] = support_sampler(dataset['test'], seed=self.seed)
-            support_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=tokenizer,
-                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
-                batch_size=16, shuffle=False)
-            bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
-        
-        cc_logits = torch.norm(bias_vector)*bias_logits
-        if debias:
-            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices, calibrate=calibrate, calib_logits=cc_logits)
+
+        # 导入数据集的时候，添加过滤功能，过滤掉prompt bias最偏向的前n个tokens
+        subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
+                                                if vocab_subset == "answer_type_tokens" else \
+                                            self.get_common_vocab_indices(self.tokenizer)
+        subvocab_tokens_indices = subvocab_tokens_indices.to(bias_logits.device)
+        subset_indices = subset_indices.to(bias_logits.device)
+
+        filtered_logits = bias_logits.index_select(dim=0, index=subvocab_tokens_indices)
+        if filter_biased_token_nums<=filtered_logits.shape[0]:
+            _, prompt_biased_indices = torch.topk(filtered_logits, k=filter_biased_token_nums)
+            prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
         else:
-            acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
+            # 超出了数据集大小，直接丢弃掉这个数据集
+            prompt_biased_vocab_indices = subset_indices.tolist()
+        
+
+        raw_test_data, _ = self.load_data(test_data_path, common_vocab=self.common_vocab, filter_out_tokens=prompt_biased_vocab_indices)
+
+        # 处理空数据集的特别情况
+        # print("数据集长度为{}".format(len(raw_test_data)))
+        if len(raw_test_data)==0:
+            acc, sub_labels, probs, allpreds, alllabels = 0, [], None, [], [] 
+        else:
+            dataset["test"] = self.wrap_input_examples(raw_test_data, tokenizer,autoprompt_postfix=autoprompt_postfix)
+            sub_labels = [d["sub_label"] for d in raw_test_data]
+
+            # get the max pad number in dataset
+            max_tokens_len = self.compute_max_pad(dataset, WrapperClass, tokenizer, prompt_template)
+            # Note: Do not shuffle!
+            test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=tokenizer,
+                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
+                batch_size=16,shuffle=False)
+            
+            promptModel = PromptModel(
+                template = prompt_template,
+                plm = plm,
+                freeze_plm=True
+            )
+            promptModel.cuda()
+            
+            if sampling_debias==True:
+                # support dataset for sampling
+                support_sampler = FewShotSampler(num_examples_total=200, also_sample_dev=False)
+                dataset['support'] = support_sampler(dataset['test'], seed=self.seed)
+                support_dataloader = PromptDataLoader(dataset=dataset["support"], template=prompt_template, tokenizer=tokenizer,
+                    tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
+                    batch_size=16, shuffle=False)
+                bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
+            
+            cc_logits = torch.norm(bias_vector)*bias_logits
+            if debias:
+                acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices, calibrate=calibrate, calib_logits=cc_logits)
+            else:
+                acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
 
         # recover the embeddings
         if embeddings_renormalize==True:
@@ -1407,7 +1445,7 @@ class Experiment():
         return output_save, avg_accuracy
 
 
-    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False, calibrate=False):
+    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False, calibrate=False, filter_biased_token_nums=0):
         """Debiasing experiments for manual prompts. 
 
         Args:
@@ -1416,6 +1454,8 @@ class Experiment():
             embeddings_renormalize (bool, optional): Whether to renormalize the embeddings of the model before probing. Defaults to False.
             ctrl_code (list, optional): which datasets are used in this exp. Defaults to [1,1,1], representing use all three datasets [lama, wiki-uni, lama_whu].
             manual_prompt (str, optional): The prompt series used in exp. Defaults to "LAMA". Could also be "LPAQA", "AutoPrompt".
+            filter_biased_token_nums (int, optional): A filtered applied to the dataset to filter out the current prompt biased data. 
+                Default to 0 that do not filter out any data. Set it to 1 means filtering out data prompt biased mostly from the dataset.
         
         Raises:
             ValueError: When `self.model_name` is not start with roberta or bert.
@@ -1433,7 +1473,7 @@ class Experiment():
             self.plm.set_output_embeddings(renormal)
             self.plm.bert.embeddings.word_embeddings.weight = renormal.weight
             
-        root_dir = self.work_dir + f"/outputs/openprompt/manual_prompt/{self.model_name}"
+        root_dir = self.work_dir + f"/outputs/openprompt/manual_prompt/filter_out_{filter_biased_token_nums}_biased_tokens/{self.model_name}"
         
         if calibrate:
             save_dir = f"{manual_prompt}/calibrate_{vocab_subset}/"
@@ -1539,7 +1579,8 @@ class Experiment():
                     vocab_subset_filter=vocab_subset_filter,
                     vocab_subset=vocab_subset,
                     test_data_path=data_paths[i],
-                    prompt=manual_prompt)
+                    prompt=manual_prompt,
+                    filter_biased_token_nums=filter_biased_token_nums)
                 acc_debias,(probs_after,_, preds_after, _) = self.manual_prompt(
                     relation, debias=True, 
                     vocab_subset_filter=vocab_subset_filter, 
@@ -1547,8 +1588,28 @@ class Experiment():
                     test_data_path=data_paths[i],
                     prompt=manual_prompt,
                     sampling_debias=sampling_debias,
-                    calibrate=calibrate)
+                    calibrate=calibrate,
+                    filter_biased_token_nums=filter_biased_token_nums)
                 
+                # 处理数据集为空的情况
+                if probs_before == None:
+                    TT_CE_before = 0
+                    TT_CE_after = 0
+                    FF_E = 0
+                    FF_E_d = 0
+                    KL_before_list = 0
+                    KL_after_list = 0
+                    print("数据集为空")
+                    pbar.update(1)
+                    postfox = {
+                        "lama_improve": 0 if ctrl_code[0]==0 or len(total_diff[0])==0 else round(sum(total_diff[0])/len(total_diff[0]), 3) * 100,
+                        "uni_improve": 0 if ctrl_code[1]==0 or len(total_diff[1])==0 else round(sum(total_diff[1])/len(total_diff[1]), 3) * 100,
+                        "lama_whu_improve": 0 if ctrl_code[2]==0 or len(total_diff[2])==0 else round(sum(total_diff[2])/len(total_diff[2]), 3) * 100,
+                        }
+
+                    pbar.set_postfix(postfox)
+                    continue
+
                 subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
                 loss = torch.nn.CrossEntropyLoss()
 
@@ -1599,24 +1660,6 @@ class Experiment():
                 # FF_CE_after = loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
                 # print(f"FF CE before: {FF_CE_before} FF CE after {FF_CE_after}")
 
-                dataset = list(output_save.keys())[i]
-                output_save[dataset]["P"].append(acc_origin)
-                output_save[dataset]["P_d"].append(acc_debias)
-
-                output_save[dataset]["TT_CE"].append(TT_CE_before)
-                output_save[dataset]["TT_CE_d"].append(TT_CE_after)
-
-                output_save[dataset]["FF_E"].append(FF_E)
-                output_save[dataset]["FF_E_d"].append(FF_E_d)
-                
-                
-                # save all preds
-                obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
-                raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
-                debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
-                indices = list(range(len(sub_labels)))
-                preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
-
                 # for KL divergence and drawing picture, transform the probs to a distribution
                 num_data = len(preds_before)
                 probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
@@ -1634,8 +1677,37 @@ class Experiment():
                 KL_before = round(np.mean(KL_before_list),5)
                 KL_after = round(np.mean(KL_after_list),5) 
 
+
+                diff = round(acc_debias - acc_origin,5)
+            
+                print("{} raw acc{} debiased acc{}".format(
+                    dataset_names[i],
+                    round(acc_origin*100,2),
+                    round(acc_debias*100,2)))
+                total_diff[i].append(diff)
+                f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
+                f.flush()
+
+
+                dataset = list(output_save.keys())[i]
+                output_save[dataset]["P"].append(acc_origin)
+                output_save[dataset]["P_d"].append(acc_debias)
+
+                output_save[dataset]["TT_CE"].append(TT_CE_before)
+                output_save[dataset]["TT_CE_d"].append(TT_CE_after)
+
+                output_save[dataset]["FF_E"].append(FF_E)
+                output_save[dataset]["FF_E_d"].append(FF_E_d)
+
                 output_save[dataset]["KL"].append(KL_before)
                 output_save[dataset]["KL_d"].append(KL_after)
+
+                # save all preds
+                obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
+                raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
+                debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
+                indices = list(range(len(sub_labels)))
+                preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
 
                 if i==first_dataset_index:
                     KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
@@ -1652,17 +1724,7 @@ class Experiment():
                 create_dir(img_save_path)
 
                 self.generate_image(preds_before,preds_after,labels,model_bias=bias_tensor, save_path=img_save_path)
-
-
-                diff = round(acc_debias - acc_origin,5)
                 
-                print("{} raw acc{} debiased acc{}".format(
-                    dataset_names[i],
-                    round(acc_origin*100,2),
-                    round(acc_debias*100,2)))
-                total_diff[i].append(diff)
-                f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
-                f.flush()
                 pbar.update(1)
                 
                 postfox = {
@@ -2613,27 +2675,14 @@ if __name__ == '__main__':
     exp = Experiment()
     output_dir = "./output/"
     exp.set_model("bert","bert-base-cased")
-    # exp.relations = ["P413"]
+    exp.relations = exp.relations[3:5]
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
-    # exp.set_model("bert","bert-base-cased")
-    # # exp.relations = ["P140"]
-    # exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased_be_ro_al.txt")
-    # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA")
-    # print(f"LAMA: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
-    # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LPAQA")
-    # print(f"LPAQA: raw_KL: {raw_KL}
-    # , debias_KL: {debias_KL}")
-    # raw_KL, debias_KL, _ = exp.quantify_prompt_bias(prompt="LAMA", meanless_word="[MASK]", sampling=False)
-    # print(f"AutoPrompt: raw_KL: {raw_KL}, debias_KL: {debias_KL}")
-    # exp.relations=["P138"]
-    # exp.relations = ["P463"]
-    # exp.experiment_renormal_vector_debias_for_continue_prompt(evaluate_mode=True, repeat_times=1)
-    output = exp.experiment_prompt_only_accuracy(prompt="OptiPrompt",do_sample=True)
-    print(output[1])
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt", ctrl_code=[1,1,1], calibrate=False)
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="LPAQA")
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(manual_prompt="AutoPrompt")
-    # exp.experiment_renormal_vector_debias_for_continue_prompt(continue_prompt="optiprompt",num_tokens=5,evaluate_mode=True, repeat_times=3)
-    # exp.save_output(output_dir+"/bert-base-cased/bert_vocab_intersection_result_sampling_debias.json")
+    
+    exp.experiment_renormal_vector_debais_for_manual_prompt(filter_biased_token_nums=32)
+
+    # exp.load_output("/mnt/code/users/xuziyang/PromptBias/results/filter_out_4_biased_tokens/bert-base-cased/common_vocab_cased/typed_querying/LAMA_result.json")
     # exp.print_output()
-    # exp.clear_output()
+    # out = exp.manual_prompt("P463", debias=True, vocab_subset="answer_type_tokens", filter_biased_token_nums=1)
+    # exp.relations = ["P413"]
+    # out = exp.experiment_prompt_only_accuracy(prompt="OptiPrompt")
+    # print(out)
