@@ -67,7 +67,7 @@ if args.do_debias:
             vocab_subset=vocab_subset,
             repeat_times=args.repeat_times,
             evaluate_mode=args.evaluate_mode,
-            # TODO 添加filer_biased_tokens
+            filter_biased_token_nums=args.filter_biased_token_nums,
         )
     exp.print_output()
 

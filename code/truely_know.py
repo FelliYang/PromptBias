@@ -946,13 +946,9 @@ class Experiment():
 
 
         # 导入数据集的时候，添加过滤功能，过滤掉prompt bias最偏向的前n个tokens
-        subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
-                                                if vocab_subset == "answer_type_tokens" else \
-                                            self.get_common_vocab_indices(self.tokenizer)
-        subvocab_tokens_indices = subvocab_tokens_indices.to(bias_logits.device)
         subset_indices = subset_indices.to(bias_logits.device)
 
-        filtered_logits = bias_logits.index_select(dim=0, index=subvocab_tokens_indices)
+        filtered_logits = bias_logits.index_select(dim=0, index=subset_indices)
         if filter_biased_token_nums<=filtered_logits.shape[0]:
             _, prompt_biased_indices = torch.topk(filtered_logits, k=filter_biased_token_nums)
             prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
@@ -1128,7 +1124,7 @@ class Experiment():
         return acc, (probs, allsubjs, allpreds, alllabels)
 
 
-    def continue_prompt(self, relation, embedding_save_dir, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none", evaluate_mode=False):
+    def continue_prompt(self, relation, embedding_save_dir, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none", evaluate_mode=False, filter_biased_token_nums=0):
         """Probe factual knowledge in the model with a continue prompt.
 
         Args:
@@ -1164,27 +1160,16 @@ class Experiment():
 
         autoprompt_train_data_path = os.path.join(self.auto_prompt_dir,relation,"train.jsonl")
         autoprompt_valid_data_path = os.path.join(self.auto_prompt_dir,relation, "dev.jsonl")
+        
+        # TODO add dataset filter
 
         raw_train_data, resample_weight = self.load_data(autoprompt_train_data_path,return_resample_weights=True)
         raw_valid_data, _ = self.load_data(autoprompt_valid_data_path)
-        raw_test_data = []
 
-        for data_path in data_paths:
-            data,_ = self.load_data(data_path, common_vocab=self.common_vocab,)
-            raw_test_data.append(data)
 
         dataset["train"] = self.wrap_input_examples(raw_train_data, tokenizer)
         dataset["valid"] = self.wrap_input_examples(raw_valid_data, tokenizer)
-
-        dataset["test"] = {}
-        dataset["test"]["lama"] =  self.wrap_input_examples(raw_test_data[0], tokenizer)
-        dataset["test"]["uni"] = self.wrap_input_examples(raw_test_data[1], tokenizer)
-        dataset["test"]["lama_whu"] = self.wrap_input_examples(raw_test_data[2], tokenizer)
         
-        sub_labels = {"lama":{},"uni":{},"lama_whu":{}}
-        sub_labels["lama"] = [d["sub_label"] for d in raw_test_data[0]]
-        sub_labels["uni"] = [d["sub_label"] for d in raw_test_data[1]]
-        sub_labels["lama_whu"] = [d["sub_label"] for d in raw_test_data[2]]
         
         if continue_prompt=="prefix":
             current_template = '{"placeholder":"text_a"} '
@@ -1219,11 +1204,6 @@ class Experiment():
                 tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                 batch_size=16)
         valid_dataloader = PromptDataLoader(dataset=dataset["valid"], template=prompt_template, tokenizer=tokenizer,
-                tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
-                batch_size=16)
-        test_dataloader = {}
-        for dataset_name in ["lama","uni","lama_whu"]:
-           test_dataloader[dataset_name] = PromptDataLoader(dataset=dataset["test"][dataset_name], template=prompt_template, tokenizer=tokenizer,
                 tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                 batch_size=16)
     
@@ -1293,16 +1273,47 @@ class Experiment():
             print("best epoch {} valid precision: {}".format(best_epoch,best_acc,))
 
         model_bias_output, bias_logits, bias_vector = self.get_continue_prompt_bias(promptModel, prompt_template, continue_prompt, best_ckpt,num_tokens)
+        subset_indices = subset_indices.to(bias_logits.device)
+        filtered_logits = bias_logits.index_select(dim=0, index=subset_indices)
+        if filter_biased_token_nums<=filtered_logits.shape[0]:
+            _, prompt_biased_indices = torch.topk(filtered_logits, k=filter_biased_token_nums)
+            prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
+        else:
+            # 超出了数据集大小，直接丢弃掉这个数据集
+            prompt_biased_vocab_indices = subset_indices.tolist()
+
+
+        test_dataloader = {}
+        raw_test_data = []
+        for data_path in data_paths:
+            data,_ = self.load_data(data_path, common_vocab=self.common_vocab, filter_out_tokens=prompt_biased_vocab_indices)
+            raw_test_data.append(data)
+        dataset["test"] = {}
+        dataset["test"]["lama"] =  self.wrap_input_examples(raw_test_data[0], tokenizer)
+        dataset["test"]["uni"] = self.wrap_input_examples(raw_test_data[1], tokenizer)
+        dataset["test"]["lama_whu"] = self.wrap_input_examples(raw_test_data[2], tokenizer)
+        
+        sub_labels = {"lama":{},"uni":{},"lama_whu":{}}
+        sub_labels["lama"] = [d["sub_label"] for d in raw_test_data[0]]
+        sub_labels["uni"] = [d["sub_label"] for d in raw_test_data[1]]
+        sub_labels["lama_whu"] = [d["sub_label"] for d in raw_test_data[2]]
 
         results  = {}
-        for dataset in ["lama","uni","lama_whu"]:
-            debias_output = self.evaluate(promptModel, test_dataloader[dataset], bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices,soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
-            origin_output = self.evaluate(promptModel, test_dataloader[dataset], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
-            acc_, (probs_, preds_, labels_) = debias_output
-            debias_output = acc_, (probs_, sub_labels[dataset],preds_, labels_)
-            acc_, (probs_, preds_, labels_) = origin_output
-            origin_output = acc_, (probs_, sub_labels[dataset],preds_, labels_)
-            results[dataset] = (debias_output,origin_output)
+        for _ in ["lama","uni","lama_whu"]:
+            if len(dataset["test"][_])==0:
+                origin_output = 0, (None, [], [], [])
+                debias_output = 0, (None, [], [], [])
+            else:
+                test_dataloader[_] = PromptDataLoader(dataset=dataset["test"][_], template=prompt_template, tokenizer=tokenizer,
+                    tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
+                    batch_size=16)
+                debias_output = self.evaluate(promptModel, test_dataloader[_], bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices,soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+                origin_output = self.evaluate(promptModel, test_dataloader[_], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+                acc_, (probs_, preds_, labels_) = debias_output
+                debias_output = acc_, (probs_, sub_labels[_],preds_, labels_)
+                acc_, (probs_, preds_, labels_) = origin_output
+                origin_output = acc_, (probs_, sub_labels[_],preds_, labels_)
+            results[_] = (debias_output,origin_output)
 
         return model_bias_output, results
             
@@ -1717,9 +1728,7 @@ class Experiment():
                 # preds和labels均是原始词汇表里面的，绘图前需要转换成subset_vocab的索引
                 preds_before = [subvocab_indices_list.index(i) for i in preds_before]
                 preds_after = [subvocab_indices_list.index(i) for i in preds_after]
-
                 labels = [subvocab_indices_list.index(i) for i in labels]
-
                 img_save_path = os.path.join(img_save_dir[i], relation+".png")
                 create_dir(img_save_path)
 
@@ -1937,7 +1946,7 @@ class Experiment():
         self.relations = lama_relations
         
 
-    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False):
+    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False, filter_biased_token_nums=0):
         """Debiasing experiments for continue prompts.
 
         Args:
@@ -1971,7 +1980,7 @@ class Experiment():
         output_results = []
         for _index in range(1,repeat_times+1):
             self.clear_output()
-            root_dir = self.work_dir + f"/outputs/openprompt/continue_prompt/{self.model_name}"
+            root_dir = self.work_dir + f"/outputs/openprompt/continue_prompt/filter_out_{filter_biased_token_nums}_biased_tokens/{self.model_name}"
             
             save_dir = continue_prompt+f"_{num_tokens}" + f"/debias_{vocab_subset}/"
             if embeddings_renormalize==True:
@@ -2023,8 +2032,15 @@ class Experiment():
 
             for relation in self.relations:
                 
-                model_bias, results = self.continue_prompt(relation, embedding_save_dir=os.path.join(root_dir,save_dir),vocab_subset_filter=vocab_subset_filter,
-                                                                        vocab_subset=vocab_subset,continue_prompt=continue_prompt,num_tokens=num_tokens, evaluate_mode=evaluate_mode)
+                model_bias, results = self.continue_prompt(relation,
+                                                            embedding_save_dir=os.path.join(root_dir,save_dir),
+                                                            vocab_subset_filter=vocab_subset_filter,
+                                                            vocab_subset=vocab_subset,
+                                                            continue_prompt=continue_prompt,
+                                                            num_tokens=num_tokens,
+                                                            evaluate_mode=evaluate_mode, 
+                                                            filter_biased_token_nums=filter_biased_token_nums
+                                                            )
                 
                 subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
                                                         if vocab_subset == "answer_type_tokens" else \
@@ -2042,37 +2058,30 @@ class Experiment():
                     debias_res,origin_res = results[dataset_names[i]]
                     acc_origin,(probs_before, sub_labels, preds_before, labels) = origin_res
                     acc_debias,(probs_after,_,  preds_after, _) = debias_res
-                    dataset = list(output_save.keys())[i]
-                    output_save[dataset]["P"].append(acc_origin)
-                    output_save[dataset]["P_d"].append(acc_debias)
+                    if probs_before == None:
+                        TT_CE_before = 0
+                        TT_CE_after = 0
+                        FF_E = 0
+                        FF_E_d = 0
+                        KL_before_list = 0
+                        KL_after_list = 0
+                        print("数据集为空")
+                        postfox = {
+                            "lama_improve": 0 if ctrl_code[0]==0 or len(total_diff[0])==0 else round(sum(total_diff[0])/len(total_diff[0]), 3) * 100,
+                            "uni_improve": 0 if ctrl_code[1]==0 or len(total_diff[1])==0 else round(sum(total_diff[1])/len(total_diff[1]), 3) * 100,
+                            "lama_whu_improve": 0 if ctrl_code[2]==0 or len(total_diff[2])==0 else round(sum(total_diff[2])/len(total_diff[2]), 3) * 100,
+                            }
 
+                        pbar.set_postfix(postfox)
+                        continue
                     # 添加TT_CE 和FF_E
                     subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
                     loss = torch.nn.CrossEntropyLoss()
-                    
-                    
-                    def cross_entropy(logits, labels):
-                        loss_per_sample = F.cross_entropy(logits, labels, reduction='none')
-                        loss_dict = {}
-                        for label,loss in zip(labels.tolist(), loss_per_sample.tolist()):
-                            if label in loss_dict:
-                                loss_dict[label].append(loss)
-                            else:
-                                loss_dict[label] = [loss]
-                        loss_list = []
-                        for key in loss_dict.keys():
-                            loss_list.append(np.mean(loss_dict[key]))
-                        
-                        return np.mean(loss_list)
 
                     equality_mask = torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & torch.eq(torch.tensor(preds_after), torch.tensor(labels))
                     common_acc_index =  torch.where(equality_mask==True)[0]
                     TT_CE_before = 0 if torch.numel(common_acc_index)==0 else loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
                     TT_CE_after = 0 if torch.numel(common_acc_index)==0 else loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
-                    # TT_CE_before = cross_entropy(probs_before, subvocab_labels)
-                    # TT_CE_after = cross_entropy(probs_after, subvocab_labels)
-                    # print(f"TT CE before: {TT_CE_before} TT CE after {TT_CE_after}")
-                    
                     equality_mask = ~torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & ~torch.eq(torch.tensor(preds_after), torch.tensor(labels))
                     common_acc_index =  torch.where(equality_mask==True)[0]
                     # 给定pred和labels, 计算得到分布
@@ -2092,23 +2101,8 @@ class Experiment():
                     # FF_E = entropy(convert_to_probability(preds_before))
                     # FF_E_d = entropy(convert_to_probability(preds_after))
 
-                    output_save[dataset]["TT_CE"].append(TT_CE_before)
-                    output_save[dataset]["TT_CE_d"].append(TT_CE_after)
-
-                    output_save[dataset]["FF_E"].append(FF_E)
-                    output_save[dataset]["FF_E_d"].append(FF_E_d)
-
-
-                    # 保存preds结果
-                    obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
-                    raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
-                    debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
-                    indices = list(range(len(sub_labels)))
-                    preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
-
                     # 计算出来分布，用于绘图和计算KL散度
                     num_data = len(preds_before)
-
                     probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
                     probs_dis_after = torch.softmax(probs_after,dim=-1).tolist()
                     KL_before_list = []
@@ -2123,29 +2117,8 @@ class Experiment():
 
                     KL_before = round(np.mean(KL_before_list),5)
                     KL_after = round(np.mean(KL_after_list),5) 
-
-                    output_save[dataset]["KL"].append(KL_before)
-                    output_save[dataset]["KL_d"].append(KL_after)
-
-                    if i==first_dataset_index:
-                        KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
-                    else:
-                        KL_save_f.write(f",{KL_before},{KL_after}")
-
                     # print(f"debais前KL散度为{KL_before} debias后KL散度为{KL_after}")
 
-
-                    # preds和labels均是原始词汇表里面的，绘图前需要转换成subset_vocab的索引
-                    preds_before = [subvocab_indices_list.index(i) for i in preds_before]
-                    preds_after = [subvocab_indices_list.index(i) for i in preds_after]
-                    
-
-                    labels = [subvocab_indices_list.index(i) for i in labels]
-
-                    img_save_path = os.path.join(img_save_dir[i], relation+".png")
-                    create_dir(img_save_path)
-
-                    self.generate_image(preds_before,preds_after,labels,model_bias=bias_tensor, save_path=img_save_path)
 
 
                     diff = round(acc_debias - acc_origin,5)
@@ -2157,6 +2130,38 @@ class Experiment():
                     total_diff[i].append(diff)
                     f.write(f"{relation},{diff},{acc_origin},{acc_debias}\n")
                     f.flush()
+
+                    dataset = list(output_save.keys())[i]
+                    output_save[dataset]["P"].append(acc_origin)
+                    output_save[dataset]["P_d"].append(acc_debias)
+                    output_save[dataset]["KL"].append(KL_before)
+                    output_save[dataset]["KL_d"].append(KL_after)
+                    output_save[dataset]["TT_CE"].append(TT_CE_before)
+                    output_save[dataset]["TT_CE_d"].append(TT_CE_after)
+                    output_save[dataset]["FF_E"].append(FF_E)
+                    output_save[dataset]["FF_E_d"].append(FF_E_d)
+
+                    # 保存preds结果
+                    obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
+                    raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
+                    debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
+                    indices = list(range(len(sub_labels)))
+                    preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
+
+                    if i==first_dataset_index:
+                        KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
+                    else:
+                        KL_save_f.write(f",{KL_before},{KL_after}")
+
+                    # preds和labels均是原始词汇表里面的，绘图前需要转换成subset_vocab的索引
+                    preds_before = [subvocab_indices_list.index(i) for i in preds_before]
+                    preds_after = [subvocab_indices_list.index(i) for i in preds_after]
+                    labels = [subvocab_indices_list.index(i) for i in labels]
+                    img_save_path = os.path.join(img_save_dir[i], relation+".png")
+                    create_dir(img_save_path)
+
+                    self.generate_image(preds_before,preds_after,labels,model_bias=bias_tensor, save_path=img_save_path)
+                    
                     
                     postfox = {
                         "run nums": _index,
