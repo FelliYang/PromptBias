@@ -2678,12 +2678,10 @@ class Experiment():
 if __name__ == '__main__':
     # An example
     exp = Experiment()
-    output_dir = "./output/"
     exp.set_model("bert","bert-base-cased")
-    exp.relations = exp.relations[3:5]
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     
-    exp.experiment_renormal_vector_debais_for_manual_prompt(filter_biased_token_nums=32)
+    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=True,)
 
     # exp.load_output("/mnt/code/users/xuziyang/PromptBias/results/filter_out_4_biased_tokens/bert-base-cased/common_vocab_cased/typed_querying/LAMA_result.json")
     # exp.print_output()

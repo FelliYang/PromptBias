@@ -1,6 +1,6 @@
 homedir=/workspace/data/users/xuziyang/code/PromptBias/TruelyKnow
 python=/root/miniconda3/envs/prompt/bin/python
-script=${homedir}/code/zero_shot.py
+script=${homedir}/code/scripts/zero_shot.py
 
 cd $homedir
 
