@@ -2519,7 +2519,7 @@ class Experiment():
                             calib_logits_answer_space = calib_logits.index_select(dim=0,index=vocab_subset_indices)
                             calib_probs = torch.softmax(calib_logits_answer_space,dim=0)
                             mask_probs = torch.softmax(mask_logits, dim=1)
-                            mask_probs -= calib_probs
+                            mask_probs /= calib_probs
                             # normalize
                             mask_probs = (mask_probs.T / torch.sum(mask_probs, dim=1)).T
                             mask_logits = torch.log(mask_probs)
