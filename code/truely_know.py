@@ -1673,6 +1673,7 @@ class Experiment():
 
                 # for KL divergence and drawing picture, transform the probs to a distribution
                 num_data = len(preds_before)
+                # probs_before is actually logit values
                 probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
                 probs_dis_after = torch.softmax(probs_after,dim=-1).tolist()
                 KL_before_list = []
@@ -1718,7 +1719,17 @@ class Experiment():
                 raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
                 debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
                 indices = list(range(len(sub_labels)))
-                preds_save[dataset][relation] = {"data":{"index":indices,"sub_label":sub_labels,"obj_labels":obj_labels,"raw_preds":raw_preds,"debiased_preds":debiased_preds}}
+                preds_save[dataset][relation] = {"data":{
+                    "index":indices,
+                    "sub_label":sub_labels,
+                    "obj_labels":obj_labels,
+                    "raw_preds":raw_preds,
+                    "debiased_preds":debiased_preds,
+                    "raw_probs":torch.tensor(probs_dis_before,dtype=torch.float16),
+                    "debiased_probs": torch.tensor(probs_dis_after,dtype=torch.float16),
+                    "label_subvocab_ids": subvocab_labels,
+                    "label_ids": labels,
+                    }}
 
                 if i==first_dataset_index:
                     KL_save_f.write(f"\n{relation},{KL_before},{KL_after}")
@@ -2681,7 +2692,7 @@ if __name__ == '__main__':
     exp.set_model("bert","bert-base-cased")
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     
-    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=True,)
+    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=False,)
 
     # exp.load_output("/mnt/code/users/xuziyang/PromptBias/results/filter_out_4_biased_tokens/bert-base-cased/common_vocab_cased/typed_querying/LAMA_result.json")
     # exp.print_output()
