@@ -24,6 +24,8 @@ parser.add_argument("--typed_querying", type=str, default="True")
 parser.add_argument("--do_debias", type=str, default="True")
 parser.add_argument("--do_calibrate", type=str, default="False")
 parser.add_argument("--eval_bias", type=str, default="False")
+parser.add_argument("--ablation_no_normalization", type=str, default="False")
+parser.add_argument("--ablation_no_rescale", type=str, default="False")
 parser.add_argument("--eval_output_path", type=str, default="none")
 parser.add_argument("--support_dataset", type=int, default=200)
 parser.add_argument("--filter_biased_token_nums", type=int, default=0)
@@ -37,6 +39,8 @@ args.typed_querying = eval(args.typed_querying)
 args.do_debias = eval(args.do_debias)
 args.do_calibrate = eval(args.do_calibrate)
 args.eval_bias = eval(args.eval_bias)
+args.ablation_no_normalization = eval(args.ablation_no_normalization)
+args.ablation_no_rescale = eval(args.ablation_no_rescale)
 
 
 manual_prompts = ["LAMA", "LPAQA", "AutoPrompt"]
@@ -60,6 +64,8 @@ if args.do_debias:
             sampling_debias=args.sampling_debias,
             calibrate=args.do_calibrate,
             filter_biased_token_nums=args.filter_biased_token_nums,
+            ablation_no_normalization=args.ablation_no_normalization,
+            ablation_no_rescale=args.ablation_no_rescale,
         )
     else:
         exp.experiment_renormal_vector_debias_for_continue_prompt(
@@ -68,6 +74,8 @@ if args.do_debias:
             repeat_times=args.repeat_times,
             evaluate_mode=args.evaluate_mode,
             filter_biased_token_nums=args.filter_biased_token_nums,
+            ablation_no_normalization=args.ablation_no_normalization,
+            ablation_no_rescale=args.ablation_no_rescale,
         )
     exp.print_output()
 

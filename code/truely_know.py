@@ -439,8 +439,8 @@ class Experiment():
                 we will take the index of first `[MASK]` token found reversely as the y_mask_index. 
 
         Returns:
-            tuple : a tuple of (bias_logits, bias_features). `bias_logits` refers to the normalized bias logits
-                `bias_features` refers to the raw bias vector.
+            tuple : a tuple of (bias_logits, bias_vector). `bias_logits` refers to the normalized bias logits
+                `bias_vector` refers to the raw bias vector.
         """
 
         # The following is an unified framework splitting the process of language model into 3 parts
@@ -485,13 +485,13 @@ class Experiment():
         # step 2
         transformer_output = transformer_output[0][object_index]
     
-        bias_features = tranform_layer(transformer_output)
-        norm2 = torch.norm(bias_features)
-        bias_logits = decoder(bias_features) / norm2
-        bias_features = bias_features.detach()
+        bias_vector = tranform_layer(transformer_output)
+        norm2 = torch.norm(bias_vector)
+        bias_logits = decoder(bias_vector) / norm2
+        bias_vector = bias_vector.detach()
         bias_logits = bias_logits.detach()
 
-        return bias_logits, bias_features    
+        return bias_logits, bias_vector    
 
 
     def get_continue_prompt_bias(self, promptModel, prompt_template, continue_prompt:str, ckpt_path=None, num_tokens=0):
@@ -506,9 +506,9 @@ class Experiment():
             ckpt_path (str, optional): the loaded checkpoint of the continue prompt. Defaults to None.
 
         Returns:
-            tuple: a tuple of (model_bias_output, bias_logits, bias_features). `model_bias_output` refers to 
+            tuple: a tuple of (model_bias_output, bias_logits, bias_vector). `model_bias_output` refers to 
                 the biased logits on the vocabulary. `bias_logits` refers to the normalized bias vector
-                `bias_features` refers to the raw bias vector.
+                `bias_vector` refers to the raw bias vector.
         """
         # The following is an unified framework splitting the process of language model into 3 parts
         # 1. transformer block
@@ -547,10 +547,10 @@ class Experiment():
             mask_token_features = tranform_layer(mask_token_bert)
             norm2 = torch.norm(mask_token_features, p=2)
             bias_logits = decoder(mask_token_features[0]) / norm2
-        bias_features = mask_token_features[0]
+        bias_vector = mask_token_features[0]
         model_bias_output = bias_logits * norm2
 
-        return model_bias_output, bias_logits, bias_features
+        return model_bias_output, bias_logits, bias_vector
 
 
     def get_prompt_bias_by_sample(self, promptModel:PromptModel, support_dataloader, evaluateMode=True, num_tokens=5):
@@ -565,8 +565,8 @@ class Experiment():
             num_tokens (int, optional): the soft tokens number. Used only when continue_prompt=='prefix'. Defaults to 5.
 
         Returns:
-            tuple : a tuple of (bias_logits, bias_features). `bias_logits` refers to the normalized bias vector
-                `bias_features` refers to the raw bias vector.
+            tuple : a tuple of (bias_logits, bias_vector). `bias_logits` refers to the normalized bias vector
+                `bias_vector` refers to the raw bias vector.
         """
         if evaluateMode==True:
             promptModel.eval()
@@ -655,9 +655,9 @@ class Experiment():
             avg_prediction_vector = avg_prediction_vector.detach()
 
         bias_logits = normalized_avg_logits
-        bias_features = avg_prediction_vector
+        bias_vector = avg_prediction_vector
 
-        return bias_logits, bias_features
+        return bias_logits, bias_vector
 
 
     def get_probs_by_sample(self, promptModel:PromptModel, support_dataloader, subvocab_indices_list, bias_vector, num_tokens=5):
@@ -854,7 +854,10 @@ class Experiment():
         return all_logits    
 
 
-    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,  embeddings_renormalize=False, prompt="LAMA", sampling_debias=False, calibrate=False, filter_biased_token_nums=0):
+    def manual_prompt(self, relation, debias=False, vocab_subset_filter=True, vocab_subset="common_vocab",test_data_path=None,
+        embeddings_renormalize=False, prompt="LAMA", sampling_debias=False, calibrate=False, filter_biased_token_nums=0,
+        ablation_no_normalization=False,
+        ablation_no_rescale=False,):
         """Probe factual knowledge in the model with a manual prompt.
 
         Args:
@@ -992,7 +995,10 @@ class Experiment():
             
             cc_logits = torch.norm(bias_vector)*bias_logits
             if debias:
-                acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices, calibrate=calibrate, calib_logits=cc_logits)
+                acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector,
+                    vocab_subset_indices=subset_indices, calibrate=calibrate, calib_logits=cc_logits,
+                    ablation_no_normalization=ablation_no_normalization,
+                    ablation_no_rescale=ablation_no_rescale,)
             else:
                 acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
 
@@ -1124,7 +1130,10 @@ class Experiment():
         return acc, (probs, allsubjs, allpreds, alllabels)
 
 
-    def continue_prompt(self, relation, embedding_save_dir, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", random_init="none", evaluate_mode=False, filter_biased_token_nums=0):
+    def continue_prompt(self, relation, embedding_save_dir, continue_prompt="prefix", num_tokens=5, vocab_subset_filter=True, vocab_subset="answer_type_tokens", 
+        random_init="none", evaluate_mode=False, filter_biased_token_nums=0,
+        ablation_no_normalization=False,
+        ablation_no_rescale=False,):
         """Probe factual knowledge in the model with a continue prompt.
 
         Args:
@@ -1225,7 +1234,15 @@ class Experiment():
         )
         promptModel.cuda()
         best_ckpt = os.path.join(embedding_save_dir, f"weight_save/{relation}/model_full-prompt_random_init.ckpt")
-        if evaluate_mode==False:
+        if evaluate_mode==True:
+            # only do evaluation
+            if not os.path.exists(best_ckpt):
+                # try to find the ckpt file in parent dir
+                dirs = embedding_save_dir.split('/')
+                best_ckpt_dir = '/'.join(dirs[:-3]+[dirs[-1]])
+                best_ckpt = os.path.join(best_ckpt_dir, f"weight_save/{relation}/model_full-prompt_random_init.ckpt")
+        else:
+            # start training
             loss_func = torch.nn.CrossEntropyLoss()
             no_decay = ['bias', 'LayerNorm.weight']
 
@@ -1307,7 +1324,10 @@ class Experiment():
                 test_dataloader[_] = PromptDataLoader(dataset=dataset["test"][_], template=prompt_template, tokenizer=tokenizer,
                     tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len,
                     batch_size=16)
-                debias_output = self.evaluate(promptModel, test_dataloader[_], bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices,soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
+                debias_output = self.evaluate(promptModel, test_dataloader[_], bias_logits=bias_logits, bias_vector=bias_vector, vocab_subset_indices=subset_indices,
+                    soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens,
+                    ablation_no_normalization=ablation_no_normalization,
+                    ablation_no_rescale=ablation_no_rescale,)
                 origin_output = self.evaluate(promptModel, test_dataloader[_], vocab_subset_indices=subset_indices, soft_tempalte_ckpt=best_ckpt,continue_prompt=continue_prompt,num_tokens=num_tokens)
                 acc_, (probs_, preds_, labels_) = debias_output
                 debias_output = acc_, (probs_, sub_labels[_],preds_, labels_)
@@ -1456,7 +1476,10 @@ class Experiment():
         return output_save, avg_accuracy
 
 
-    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False, ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False, calibrate=False, filter_biased_token_nums=0):
+    def experiment_renormal_vector_debais_for_manual_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False,
+         ctrl_code=[1,1,1], manual_prompt="LAMA", sampling_debias=False, calibrate=False, filter_biased_token_nums=0,
+         ablation_no_normalization=False,
+         ablation_no_rescale=False):
         """Debiasing experiments for manual prompts. 
 
         Args:
@@ -1495,6 +1518,17 @@ class Experiment():
             save_dir += "renormalize_embedding"
         else:
             save_dir += "origin_embedding"
+
+        # additional output path for ablation experiments
+        if ablation_no_normalization or ablation_no_rescale:
+            save_dir += "/ablations"
+            if ablation_no_normalization and ablation_no_rescale:
+                save_dir += "/no_norm_no_rescale"
+            elif ablation_no_normalization:
+                save_dir += "/no_normalization"
+            else:
+                save_dir += "/no_rescale"
+        
             
         dataset_names = ["lama","uni","lama_whu"]
         dataset_num = len(ctrl_code)
@@ -1591,7 +1625,9 @@ class Experiment():
                     vocab_subset=vocab_subset,
                     test_data_path=data_paths[i],
                     prompt=manual_prompt,
-                    filter_biased_token_nums=filter_biased_token_nums)
+                    filter_biased_token_nums=filter_biased_token_nums,
+                    ablation_no_normalization=ablation_no_normalization,
+                    ablation_no_rescale=ablation_no_rescale,)
                 acc_debias,(probs_after,_, preds_after, _) = self.manual_prompt(
                     relation, debias=True, 
                     vocab_subset_filter=vocab_subset_filter, 
@@ -1600,7 +1636,9 @@ class Experiment():
                     prompt=manual_prompt,
                     sampling_debias=sampling_debias,
                     calibrate=calibrate,
-                    filter_biased_token_nums=filter_biased_token_nums)
+                    filter_biased_token_nums=filter_biased_token_nums,
+                    ablation_no_normalization=ablation_no_normalization,
+                    ablation_no_rescale=ablation_no_rescale,)
                 
                 # 处理数据集为空的情况
                 if probs_before == None:
@@ -1957,7 +1995,10 @@ class Experiment():
         self.relations = lama_relations
         
 
-    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False,ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False, filter_biased_token_nums=0):
+    def experiment_renormal_vector_debias_for_continue_prompt(self, vocab_subset_filter=True, vocab_subset="answer_type_tokens", embeddings_renormalize=False,
+        ctrl_code=[1,1,1], continue_prompt="optiprompt", num_tokens=5, repeat_times=3, evaluate_mode=False, filter_biased_token_nums=0,
+        ablation_no_normalization=False,
+        ablation_no_rescale=False):
         """Debiasing experiments for continue prompts.
 
         Args:
@@ -1999,8 +2040,19 @@ class Experiment():
             else:
                 save_dir += "origin_embedding"
             
+            # additional output path for ablation experiments
+            if ablation_no_normalization or ablation_no_rescale:
+                save_dir += "/ablations"
+                if ablation_no_normalization and ablation_no_rescale:
+                    save_dir += "/no_norm_no_rescale"
+                elif ablation_no_normalization:
+                    save_dir += "/no_normalization"
+                else:
+                    save_dir += "/no_rescale"
+
             save_dir += f"/exp_{_index}"
-            
+            embedding_save_dir = os.path.join(root_dir,save_dir)
+
             dataset_names = ["lama","uni","lama_whu"]
             dataset_num = len(ctrl_code)
             files = [None]*dataset_num
@@ -2044,13 +2096,15 @@ class Experiment():
             for relation in self.relations:
                 
                 model_bias, results = self.continue_prompt(relation,
-                                                            embedding_save_dir=os.path.join(root_dir,save_dir),
+                                                            embedding_save_dir=embedding_save_dir,
                                                             vocab_subset_filter=vocab_subset_filter,
                                                             vocab_subset=vocab_subset,
                                                             continue_prompt=continue_prompt,
                                                             num_tokens=num_tokens,
                                                             evaluate_mode=evaluate_mode, 
-                                                            filter_biased_token_nums=filter_biased_token_nums
+                                                            filter_biased_token_nums=filter_biased_token_nums,
+                                                            ablation_no_normalization=ablation_no_normalization,
+                                                            ablation_no_rescale=ablation_no_rescale,
                                                             )
                 
                 subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
@@ -2438,7 +2492,9 @@ class Experiment():
                 vocab_subset_indices=None,
                 soft_tempalte_ckpt=None, 
                 continue_prompt="prefix",num_tokens=5,
-                calibrate=False, calib_logits=None):
+                calibrate=False, calib_logits=None,
+                ablation_no_normalization=False,
+                ablation_no_rescale=False,):
         """Evaluate the raw or debiased acc in a dataset.
 
         Args:
@@ -2536,11 +2592,11 @@ class Experiment():
                             mask_logits = torch.log(mask_probs)
                         else:
                             batched_debiased_logits = None
-                            D_T = bias_vector / torch.norm(bias_vector)
+                            D_T = bias_vector / torch.norm(bias_vector) if not ablation_no_normalization else bias_vector
                             for i in range(mask_token_features.shape[0]):
-                                D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i])
-                                D_debias = (D_Tx - D_T) / torch.norm(D_Tx - D_T)
-                                V_debias = D_debias * torch.norm(mask_token_features[i])
+                                D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i]) if not ablation_no_normalization else mask_token_features[i]
+                                D_debias = (D_Tx - D_T) / torch.norm(D_Tx - D_T) if not ablation_no_normalization else D_Tx - D_T
+                                V_debias = D_debias * torch.norm(mask_token_features[i]) if not ablation_no_rescale else D_debias
                                 debiased_logits = decoder(V_debias).unsqueeze(dim=0)
                                 if batched_debiased_logits == None:
                                     batched_debiased_logits = debiased_logits
@@ -2568,11 +2624,11 @@ class Experiment():
                         # linear层之后的特征向量, 论文理论框架中用于debias的向量
                         prediction_vectors = mask_token_features
                         batched_debiased_logits = None
-                        D_T = bias_vector / torch.norm(bias_vector)
+                        D_T = bias_vector / torch.norm(bias_vector) if not ablation_no_normalization else bias_vector
                         for i in range(mask_token_features.shape[0]):
-                            D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i])
-                            D_debias = D_Tx - D_T / torch.norm(D_Tx - D_T)
-                            V_debias = D_debias * torch.norm(mask_token_features[i])
+                            D_Tx = mask_token_features[i] / torch.norm(mask_token_features[i]) if not ablation_no_normalization else mask_token_features[i]
+                            D_debias = (D_Tx - D_T) / torch.norm(D_Tx - D_T) if not ablation_no_normalization else D_Tx - D_T
+                            V_debias = D_debias * torch.norm(mask_token_features[i]) if not ablation_no_rescale else D_debias
                             debiased_logits = decoder(V_debias).unsqueeze(dim=0)
                             if batched_debiased_logits == None:
                                 batched_debiased_logits = debiased_logits
