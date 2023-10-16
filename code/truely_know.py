@@ -952,13 +952,22 @@ class Experiment():
         subset_indices = subset_indices.to(bias_logits.device)
 
         filtered_logits = bias_logits.index_select(dim=0, index=subset_indices)
-        if filter_biased_token_nums<=filtered_logits.shape[0]:
-            _, prompt_biased_indices = torch.topk(filtered_logits, k=filter_biased_token_nums)
-            prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
+        if filter_biased_token_nums >= 0:
+            if filter_biased_token_nums<=filtered_logits.shape[0]:
+                _, prompt_biased_indices = torch.topk(filtered_logits, k=filter_biased_token_nums)
+                prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
+            else:
+                # 超出了数据集大小，直接丢弃掉这个数据集
+                prompt_biased_vocab_indices = subset_indices.tolist()
         else:
-            # 超出了数据集大小，直接丢弃掉这个数据集
-            prompt_biased_vocab_indices = subset_indices.tolist()
-        
+            # -1 代表移除数据集中所有bias有放大作用的examples
+            assert filter_biased_token_nums == -1
+            answer_space_size = filtered_logits.shape[0]
+            random_p = 1 / answer_space_size
+            # filtered_logits是normlized过的，需要缩放会原始大小
+            prompt_biased_indices = (torch.softmax(filtered_logits*torch.norm(bias_vector),dim=-1) > random_p).nonzero().view(-1)
+            prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
+
 
         raw_test_data, _ = self.load_data(test_data_path, common_vocab=self.common_vocab, filter_out_tokens=prompt_biased_vocab_indices)
 
@@ -2747,8 +2756,8 @@ if __name__ == '__main__':
     exp = Experiment()
     exp.set_model("bert","bert-base-cased")
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
-    
-    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=False,)
+    exp.relations = ["P140","P413"]
+    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=False,filter_biased_token_nums=-1)
 
     # exp.load_output("/mnt/code/users/xuziyang/PromptBias/results/filter_out_4_biased_tokens/bert-base-cased/common_vocab_cased/typed_querying/LAMA_result.json")
     # exp.print_output()

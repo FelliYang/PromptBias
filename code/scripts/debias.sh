@@ -1,14 +1,18 @@
-model_types=("bert" "bert" "roberta")
-model_names=("bert-base-cased" "bert-large-cased" "roberta-large")
-inter_vocabs=("common_vocab_cased" "common_vocab_cased" "common_vocab_cased_be_ro_al")
-# model_types=("roberta")
-# model_names=("roberta-base")
-# inter_vocabs=("common_vocab_cased_be_ro_al")
+# model_types=("bert" "bert" "roberta")
+# model_names=("bert-base-cased" "bert-large-cased" "roberta-large")
+# inter_vocabs=("common_vocab_cased" "common_vocab_cased" "common_vocab_cased_be_ro_al")
+model_types=("bert")
+model_names=("bert-base-cased")
+inter_vocabs=("common_vocab_cased")
 run_sh=/mnt/code/users/xuziyang/PromptBias/code/scripts/run.sh
 
-ABLATION_NO_NORMALIZATION=True
-ABLATION_NO_RESCALE=True
-filter_biased_token_nums=32
+ABLATION_NO_NORMALIZATION=False
+ABLATION_NO_RESCALE=False
+filter_biased_token_nums=-1
+
+export CALIBRATE=True
+
+
 
 
 for ((i=0; i<${#model_types[@]}; i++))
