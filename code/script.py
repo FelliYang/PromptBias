@@ -16,7 +16,7 @@ parser.add_argument("--seed", type=int, default=7)
 parser.add_argument(
     "--common_vocab", type=str, default="common_vocab_cased_be_ro_al.txt"
 )
-parser.add_argument("--repeat_times", type=int, default=1)
+parser.add_argument("--repeat_times", type=int, default=3)
 parser.add_argument("--evaluate_mode", type=str, default="True")
 parser.add_argument("--sampling_debias", type=str, default="False")
 parser.add_argument("--save_path", type=str, default="none")
