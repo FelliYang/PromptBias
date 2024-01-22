@@ -1,4 +1,6 @@
 # output dir
+temp.py
+private
 outputs/
 output/
 code/analysis/*

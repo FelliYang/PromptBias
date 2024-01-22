@@ -42,7 +42,7 @@ parser.add_argument("--sample_num",type=int, default=200)
 parser.add_argument("--num_epochs",type=int, default=10)
 parser.add_argument("--learning_rate",type=float, default=3e-2)
 parser.add_argument("--warmup_proportion",type=float, default=0)
-parser.add_argument("--shot", type=int, default=32)
+parser.add_argument("--shot", type=int, default=16)
 parser.add_argument("--debias_educated", type=float, default=True)
 parser.add_argument("--educated_by_sample", type=bool, default=True)
 
