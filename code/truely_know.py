@@ -25,10 +25,10 @@ from transformers import (AdamW, AutoModelForMaskedLM, AutoTokenizer,
                           BertConfig, BertModel,AutoConfig,
                           get_linear_schedule_with_warmup,
                           get_cosine_schedule_with_warmup,
-                          BertForMaskedLM, RobertaForMaskedLM,PreTrainedModel)
+                          BertForMaskedLM, RobertaForMaskedLM, PreTrainedModel, LlamaForCausalLM)
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-from .utils import load_json, load_jsonl, load_vocab, set_seed, create_dir
+from utils import load_json, load_jsonl, load_vocab, set_seed, create_dir
 from torch import nn
 import torch.nn.functional as F
 from matplotlib import pyplot as plt
@@ -98,6 +98,14 @@ class Experiment():
         self.model_config = model_config
         self.WrapperClass = WrapperClass
 
+        if self.model_type=="llama":
+            self.lama_template_path = self.work_dir + "/relation_metainfo/LAMA_relations_auto_regressive.jsonl"
+            data = load_jsonl(self.lama_template_path)
+            self.lama_template = dict([(item["relation"], item["template"]) for item in data])
+            self.LPAQA_template_path = self.work_dir + "/relation_metainfo/LPAQA_relations_auto_regressive.jsonl"
+            data = load_jsonl(self.LPAQA_template_path)
+            self.LPAQA_template = dict([(item["relation"], item["template"]) for item in data])
+
 
     def set_common_vocab(self, common_vocab_path):
         self.common_vocab = load_vocab(common_vocab_path)
@@ -165,7 +173,7 @@ class Experiment():
             filter_repeat (bool, optional): whether to filter out repeat data items. Defaults to True.
             filter_out_tokens (list, optional): Forcefully filter out data with labels present in this list.
             return_resample_weights (bool, optional): whether to return a resample weights, which can be used to avoid a extreme label distribution in training. Defaults to False.
-            close_filter (bool, optional): whether to close all filters
+            close_filter (bool, optional): whether to close all filters. Defaults set to False
 
         Returns:
             (list, None): the dataset loaded.
@@ -199,7 +207,7 @@ class Experiment():
             obj_token = self.tokenizer.tokenize(' ' + x)[0]
             id = self.tokenizer.convert_tokens_to_ids(obj_token)
             return id
-
+        # FIXME: 由于multi-token暂时不支持filter_token 设置，所以当前代码兼容，后续需要修改
         if not close_filter and (filter_out_tokens != []):
             current_len = len(data)
             data = list(filter(lambda x: _token_to_id(x["obj_label"]) not in filter_out_tokens, data))
@@ -265,13 +273,50 @@ class Experiment():
             # This space is added since RoBERTa use BPE tokenizer. 
             # A prefix space is important for BPE to differ (ĠHello) from (Hello).
             tokens = tokenizer.tokenize(' ' + str(word))
-            if (len(tokens) == 1) and (tokens[0] != tokenizer.unk_token_id):
+            if (len(tokens) == 1) and (tokens[0] != tokenizer.unk_token):
                 index_list.append(tokenizer.convert_tokens_to_ids(tokens)[0])
             else:
                 msg = f"word {word} in the common vocab is not in the model vocabulary or its length is larger than 1! \
                 This might cause unexpected errors. Please ensure this warning has been eliminated!"
                 warnings.warn(msg, Warning)
         index_list.sort()
+        return index_list
+
+
+    def get_multi_token_vocab_subset_indices(self, vocab_subset, tokenizer:PreTrainedTokenizer):
+        """Map the vocab subset to the model vocab. 
+        
+        For each word in the vocab subset, get the corresponding index in the model vocab.
+        A exampled format is [(23,26,29), (78, 12, 345), (287, 12), ...]
+
+        Args:
+            vocab_subset (list): a subset of the model vocabulary, for example, a common vocab or a answer entity vocab.
+            tokenizer (PreTrainedTokenizer): the tokenizer of the pretrained language model.
+
+        Returns:
+            list:  A list of indices, sorted from smallest to largest.
+        """
+        
+        
+        index_list = []
+        for word in vocab_subset:
+            # This space is added since RoBERTa use BPE tokenizer. 
+            # A prefix space is important for BPE to differ (ĠHello) from (Hello).
+            if self.model_type=="roberta":
+                tokens = tokenizer.tokenize(' ' + str(word))
+            elif self.model_type=="llama":
+                # 对于lama模型,会默认认为有空白符号的prefix '_' 可以理解成lama在句子的开头标记<s>和第一个单词之间一定会加一个空白
+                tokens = tokenizer.tokenize(str(word))
+            else:
+                # 对于其他模型,会直接忽视空白
+                tokens = tokenizer.tokenize(str(word))
+            if tokenizer.unk_token not in tokens:
+                index_list.append(tuple(tokenizer.convert_tokens_to_ids(tokens)))
+            else:
+                msg = f"word {word} in the common vocab is not in the model vocabulary.\
+                This might cause unexpected errors. Please ensure this warning has been eliminated!"
+                warnings.warn(msg, Warning)
+        index_list = sorted(index_list, key=lambda x:x[0])
         return index_list
 
 
@@ -288,6 +333,19 @@ class Experiment():
         indices = torch.as_tensor(index_list)
         return indices
 
+
+    def get_multi_token_common_vocab_indices(self, tokenizer:PreTrainedTokenizer):
+        """A simple wrap of get_vocab_subset_indices when the vocab_subset is self.common_vocab.
+
+        Args:
+            tokenizer (PreTrainedTokenizer): the tokenizer of the pretrained language model.
+
+        Returns:
+            tensor: model vocab's indices for the common vocab, sorted from smallest to largest.
+        """
+        index_list = self.get_multi_token_vocab_subset_indices(self.common_vocab,tokenizer)
+        return index_list
+    
 
     def get_answer_entity_indices(self, relation, 
                 tokenizer:PreTrainedTokenizer, 
@@ -364,6 +422,85 @@ class Experiment():
         return torch.tensor(index_list)
 
 
+    def get_multi_token_answer_entity_indices(self, relation, 
+                tokenizer:PreTrainedTokenizer, 
+                include_multi_lama=True,
+                include_lama_labels=True,
+                include_uni_labels=True, 
+                include_templama_labels=False,
+                common_vocab_intersection=True):
+        """Get the answer space vocab indices.
+
+        When use the Typed Query, we would consturct a answer space for each relation. For example,
+        the answer space of relation P19 (birthplace) should consists of cities. This func can return
+        multi-words cities in the model vocabulary.
+
+        Args:
+            relation (str): the target relation
+            tokenizer (PreTrainedTokenizer): tokenizer of the pretrained languaage model
+            include_multi_lama (bool, optional): whether to consider the entity.json into the answer space. Defaults to True. 
+            include_lama_labels (bool, optional): whether to consider the labels of the same `relation` in LAMA dataset into the answer space. 
+                In default, we had consideres the labels of LAMA dataset. Defaults to True. 
+            include_uni_labels (bool, optional): whether to consider the labels of the same `relation` in UNI dataset into the answer space. 
+                In default, we had consideres the labels of UNI dataset. Defaults to True. 
+            include_templama_labels (bool, optional): whether to consider the labels of the same `relation` in TEMPLAMA dataset into the answer space.
+                Defaults to False.
+            common_vocab_intersection (bool, optional): whether to intersect the answer space with common vocab to ensure 
+                all candidate words are in the common vocabulary. Defaults to True.
+
+        Returns:
+            tensor: model vocab's indices for the answer space, sorted from smallest to largest.
+        """
+
+        # take the entity.json as the base answer space, which is constructed by 
+        # "multilingual lama: investigating knowledge in multilingual pretrained language models"
+        entity_data = []
+
+        if include_multi_lama:
+            entity_path = self.work_dir + "/data/entity.json"
+            entity_data = load_json(entity_path)[relation]
+            entity_data = entity_data["objects"]
+
+        # add labels of the same relation in LAMA dataset to the answer space
+        if include_lama_labels:
+            lama_path = os.path.join(self.lama_data_dir,f"{relation}.jsonl")
+            lama_data = load_jsonl(lama_path)
+            lama_labels = [ item["obj_label"] for item in lama_data]
+            entity_data += lama_labels
+
+        if include_uni_labels:
+            # add labels of the same relation in UNI dataset to the answer space
+            uni_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
+            uni_data = load_json(uni_path)
+            uni_labels = [ item["obj_label"] for item in uni_data]
+            entity_data += uni_labels
+        
+        if include_templama_labels:
+            # add labels of the same relation in tempLAMA dataset to the answer space
+            templama_path = os.path.join(self.templama_data_dir,f"{relation}.jsonl")
+            templama_data = load_jsonl(templama_path)
+            templama_labels = [item["answer"][0]["name"] for item in templama_data]
+            entity_data += templama_labels
+
+        def filter_common_vocab_subset(word):
+            if word in self.common_vocab:
+                return True
+            else:
+                return False
+        if common_vocab_intersection:
+            # intersect answer space with common vocab
+            entity_data = list(filter(filter_common_vocab_subset,entity_data))
+        
+        # remove repeat tokens in the answer space
+        entity_data = list(set(entity_data))
+
+
+        index_list = self.get_multi_token_vocab_subset_indices(entity_data,tokenizer)
+        return index_list
+
+
+
+
     def generate_model_bias(self, model:PreTrainedModel, tokenizer:AutoTokenizer, prompt_only, save_path=None, vocab_subset_indices=None, return_logits=False,):
         """Get the model bias distribution on the vocab (or vocab subset) for the given prompt.
         
@@ -385,9 +522,18 @@ class Experiment():
         Returns:
            tensor : a logits tensor or a probs tensor representing the model bias for the given prompt.
         """
+
         
-        if not isinstance(prompt_only,list):
-            model_input = tokenizer(prompt_only,return_tensors="pt")
+
+        assert type(prompt_only)==str
+        
+        MultiToken = True if type(vocab_subset_indices[0])==tuple else False
+        if self.model_type=="llama":
+            assert MultiToken
+
+        model_input = tokenizer(prompt_only,return_tensors="pt")
+       
+        def find_mask_id():
             mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
             input_token_ids = model_input["input_ids"][0].tolist()
             # 从处理好的输入ids中找出来最后一个mask_id
@@ -397,16 +543,32 @@ class Experiment():
                     y_mask_index = -(i+1) 
                     break
             assert y_mask_index < 0
-            with torch.no_grad():
-                model_input = {k:v.to(model.device) for k,v in model_input.items()}
-                model_output = model(**model_input).logits
-                distribution = model_output[0][y_mask_index].cpu()
-                if vocab_subset_indices != None:
-                    distribution = distribution.index_select(dim=0,index=vocab_subset_indices)
-                if not return_logits:
-                    final_output = torch.softmax(distribution,0)
-                else:
-                    final_output = distribution
+            return y_mask_index
+
+        if self.model_type=="llama":
+            output_index = -1
+        else:
+            output_index = find_mask_id()
+
+        # inference
+        with torch.no_grad():
+            model_input = {k:v.to(model.device) for k,v in model_input.items()}
+            model_output = model(**model_input).logits
+            distribution = model_output[0][output_index].cpu()
+            if vocab_subset_indices != None:
+                first_token_indices = [s[0] for s in vocab_subset_indices] if MultiToken else vocab_subset_indices
+                # NOTE: 可能会有重复的token
+                
+                first_token_indices = torch.as_tensor(first_token_indices)
+                distribution = distribution.index_select(dim=0,index=first_token_indices)
+            if return_logits:
+                final_output = distribution
+            else:
+                # return probs
+                assert MultiToken==False
+                # FIXME: 对于multi token的bias分布,会存在重复first_token的情况, 因此计算概率不能直接使用softmax
+                final_output = torch.softmax(distribution,0)
+                
 
         if save_path!=None:
             assert return_logits==False
@@ -419,11 +581,10 @@ class Experiment():
             with open(save_path, "w") as f:
                 json.dump(output,f,indent=4)
         
-
         return final_output
-   
 
-    def get_manual_prompt_bias(self, model,tokenizer, template, template_embeddings=None, object_index='unk'):
+
+    def get_manual_prompt_bias(self, model, tokenizer, template, template_embeddings=None, object_index='unk', template_postfix=None):
         """Generate the model bias tensor used to debias. Used only for manual prompts or its variants.
 
         Args:
@@ -437,6 +598,7 @@ class Experiment():
                 This param is used when there are soft tokens in the template.
             y_mask_index (str, optional): the object token index in the template. Defaults to 'unk', which means 
                 we will take the index of first `[MASK]` token found reversely as the y_mask_index. 
+            template_postfix (list, optional): used in multi-token debias, which will be used to add to the back of prompt-only-template input_ids
 
         Returns:
             tuple : a tuple of (bias_logits, bias_vector). `bias_logits` refers to the normalized bias logits
@@ -455,7 +617,13 @@ class Experiment():
             transformer_blocks = model.roberta
             tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
             decoder = model.lm_head.decoder
+        elif isinstance(model, LlamaForCausalLM):
+            transformer_blocks = model.model
+            tranform_layer = None
+            decoder = model.lm_head
         
+        input_is_batch = False
+
         # when template=="soft mask", template_embeddings!=None
         if template=="soft mask":
             assert template_embeddings!=None, "when template==\"soft mask\", template_embeddings!=None"
@@ -464,32 +632,56 @@ class Experiment():
         else:
             model_input = tokenizer(template,return_tensors="pt")
             model_input = {key:value.to(model.device) for key,value in model_input.items()}
+            
+            if template_postfix:
+                # 添加post fix，从单个输入变成batch 输入
+                input_is_batch = True
+                batch_size = len(template_postfix)
+                model_input["input_ids"] = model_input["input_ids"].repeat(batch_size,1)
+                postfix = torch.as_tensor(template_postfix, dtype=model_input["input_ids"].dtype).to(model_input["input_ids"].device)
+                model_input["input_ids"] = torch.cat((model_input["input_ids"], postfix), dim=1)
+                model_input["attention_mask"] = torch.ones(model_input["input_ids"].shape, dtype=model_input["input_ids"].dtype).to(model_input["input_ids"].device)
+                
+                
         
-        # step 1
-        transformer_output = transformer_blocks(**model_input)[0]
-        
-        # find the the object token index in the template
-        if object_index=='unk':
-            object_index = 0
-            mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-            input_token_ids = model_input["input_ids"][0].tolist()
-            # from back to front
-            for i,e in enumerate(reversed(input_token_ids)):
-                if e == mask_id:
-                    object_index = -(i+1) 
-                    break
-            assert object_index < 0
-        else:
-            object_index = int(object_index)
+        with torch.no_grad():
+            # step 1
+            transformer_output = transformer_blocks(**model_input)[0]
+            
+            # if we don't know the object index, find the the object token index in the template
+            if isinstance(model, LlamaForCausalLM):
+                object_index=-1
+            else:
+                if object_index=='unk':
+                    object_index = 0
+                    mask_id = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+                    input_token_ids = model_input["input_ids"][0].tolist()
+                    # from back to front
+                    for i,e in enumerate(reversed(input_token_ids)):
+                        if e == mask_id:
+                            object_index = -(i+1) 
+                            break
+                    assert object_index < 0
+                else:
+                    object_index = int(object_index)
 
-        # step 2
-        transformer_output = transformer_output[0][object_index]
-    
-        bias_vector = tranform_layer(transformer_output)
-        norm2 = torch.norm(bias_vector)
-        bias_logits = decoder(bias_vector) / norm2
-        bias_vector = bias_vector.detach()
-        bias_logits = bias_logits.detach()
+            # step 2
+            if tranform_layer:
+                transformer_output = transformer_output[0][object_index]
+                bias_vector = tranform_layer(transformer_output)
+            else:
+                if input_is_batch:
+                    bias_vector = transformer_output[:,object_index,:]
+                else:
+                    bias_vector = transformer_output[0][object_index]
+                    
+            # step 3
+            if input_is_batch:
+                norm2 = torch.norm(bias_vector, dim=1)
+                bias_logits = decoder(bias_vector) / norm2[:,None]
+            else:
+                norm2 = torch.norm(bias_vector)
+                bias_logits = decoder(bias_vector) / norm2
 
         return bias_logits, bias_vector    
 
@@ -907,12 +1099,16 @@ class Experiment():
             if vocab_subset=="common_vocab":
                 subset_indices = self.get_common_vocab_indices(tokenizer)
             elif vocab_subset=="answer_type_tokens":
-                subset_indices = self.get_answer_entity_indices(relation, tokenizer)
+                if self.model_type=="llama":
+                    subset_indices = self.get_multi_token_answer_entity_indices(relation, self.tokenizer)
+                else:
+                    subset_indices = self.get_answer_entity_indices(relation, tokenizer)
             else:
                 raise ValueError(f"an invalid param: {vocab_subset}")
         else:
             subset_indices = None
-        
+
+
         dataset = {}
         
         # default test dataset
@@ -947,35 +1143,63 @@ class Experiment():
         # transform to the template with OpenPrompt's format.
         template = raw_template.replace(first_token,'{"placeholder":"text_a"}') if prompt=="AutoPrompt" else \
                     raw_template.replace("[X]", '{"placeholder":"text_a"}')
-        template = template.replace("[Y]", '{"mask"}')
+       
+        if self.model_type=="llama":
+            # 对于llama分词器 会自动添加prefix space，因此{"placeholder":"text_a"}和周围的文本之间不能存在空格，也就是说
+            # The {"placeholder":"text_a"} is a member of {"mask"}应该被写成
+            # The{"placeholder":"text_a"}is a member of{"mask"}
+            template = '{"placeholder":"text_a"}'.join([s.strip() for s in template.split('{"placeholder":"text_a"}')])
+       # FIXME: 
+        if self.model_type=="llama":
+            y_pos = template.find("[Y]")
+            template = template[:y_pos].strip()
+            template += '{"mask"}'
+        else:
+            template = template.replace("[Y]", '{"mask"}')
+            
         prompt_template = ManualTemplate(tokenizer=tokenizer, text=template)
 
         # constrct a prompt_pnly_template used to calculate the prompt bias vector
-        prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
-        bias_logits, bias_vector = self.get_manual_prompt_bias(model,tokenizer, template=prompt_only_tempalte)
-
-
-        # 导入数据集的时候，添加过滤功能，过滤掉prompt bias最偏向的前n个tokens
-        subset_indices = subset_indices.to(bias_logits.device)
-
-        filtered_logits = bias_logits.index_select(dim=0, index=subset_indices)
-        if filter_biased_token_nums >= 0:
-            if filter_biased_token_nums<=filtered_logits.shape[0]:
-                _, prompt_biased_indices = torch.topk(filtered_logits, k=filter_biased_token_nums)
-                prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
-            else:
-                # 超出了数据集大小，直接丢弃掉这个数据集
-                prompt_biased_vocab_indices = subset_indices.tolist()
+        # for mask language model
+        if self.model_type != "llama":
+            prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
         else:
-            # -1 代表移除数据集中所有bias有放大作用的examples
-            assert filter_biased_token_nums == -1
-            answer_space_size = filtered_logits.shape[0]
-            random_p = 1 / answer_space_size
-            # filtered_logits是normlized过的，需要缩放会原始大小
-            prompt_biased_indices = (torch.softmax(filtered_logits*torch.norm(bias_vector),dim=-1) > random_p).nonzero().view(-1)
-            prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
+            # for auto regressive model like LlamA
+            # NOTE: 考虑末尾字符是不是应该添加一个额外的空白, 我觉得不应该添加
+            # NOTE: 考虑换使用mask ; null 替代无意义输入
+            prompt_only_template = raw_template.replace("[X]", "N/A")
+            # 截断raw_template [Y]以及之后的的内容
+            y_pos = prompt_only_template.find("[Y]")
+            prompt_only_template = prompt_only_template[:y_pos].strip()
 
+        bias_logits, bias_vector = self.get_manual_prompt_bias(model, tokenizer, template=prompt_only_template)
 
+        # TODO: multi-token的时候，暂时没有实现filter_token功能
+        MultiToken = True if type(subset_indices[0])==tuple else False
+        
+        if not MultiToken:
+            # 导入数据集的时候，添加过滤功能，过滤掉prompt bias最偏向的前n个tokens
+            subset_indices = subset_indices.to(bias_logits.device)
+
+            filtered_logits = bias_logits.index_select(dim=0, index=subset_indices)
+            if filter_biased_token_nums >= 0:
+                if filter_biased_token_nums<=filtered_logits.shape[0]:
+                    _, prompt_biased_indices = torch.topk(filtered_logits, k=filter_biased_token_nums)
+                    prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
+                else:
+                    # 超出了数据集大小，直接丢弃掉这个数据集
+                    prompt_biased_vocab_indices = subset_indices.tolist()
+            else:
+                # -1 代表移除数据集中所有bias有放大作用的examples
+                assert filter_biased_token_nums == -1
+                answer_space_size = filtered_logits.shape[0]
+                random_p = 1 / answer_space_size
+                # filtered_logits是normlized过的，需要缩放会原始大小
+                prompt_biased_indices = (torch.softmax(filtered_logits*torch.norm(bias_vector),dim=-1) > random_p).nonzero().view(-1)
+                prompt_biased_vocab_indices = subset_indices[prompt_biased_indices].tolist()
+        else:
+            prompt_biased_vocab_indices = []
+        
         raw_test_data, _ = self.load_data(test_data_path, common_vocab=self.common_vocab, filter_out_tokens=prompt_biased_vocab_indices)
 
         # 处理空数据集的特别情况
@@ -991,13 +1215,19 @@ class Experiment():
             # Note: Do not shuffle!
             test_dataloader = PromptDataLoader(dataset=dataset["test"], template=prompt_template, tokenizer=tokenizer,
                 tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
-                batch_size=16,shuffle=False)
+                batch_size=16,shuffle=False, padding_side=self.tokenizer.padding_side)
             
+            # extract labels from test_dataloader
+            dataset_labels = [tuple(item[1]["label"])  for item in test_dataloader.wrapped_dataset]
+
             promptModel = PromptModel(
                 template = prompt_template,
                 plm = plm,
-                freeze_plm=True
+                freeze_plm=True,
+                plm_eval_mode=True
             )
+
+
             promptModel.cuda()
             
             if sampling_debias==True:
@@ -1010,13 +1240,19 @@ class Experiment():
                 bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
             
             cc_logits = torch.norm(bias_vector)*bias_logits
-            if debias:
-                acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector,
-                    vocab_subset_indices=subset_indices, calibrate=calibrate, calib_logits=cc_logits,
-                    ablation_no_normalization=ablation_no_normalization,
-                    ablation_no_rescale=ablation_no_rescale,)
+            if self.model_type=="llama":
+                if debias:
+                    acc,(probs, allpreds, alllabels) = self.evalute_multi_token(promptModel, test_dataloader, dataset_labels , vocab_subset_indices=subset_indices, prompt_only_template=prompt_only_template, debias=True)
+                else:
+                    acc,(probs, allpreds, alllabels) = self.evalute_multi_token(promptModel, test_dataloader, dataset_labels , vocab_subset_indices=subset_indices, prompt_only_template=prompt_only_template, debias=False)
             else:
-                acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, vocab_subset_indices=subset_indices)
+                if debias:
+                    acc,(probs, allpreds, alllabels) = self.evaluate(promptModel,test_dataloader, bias_logits=bias_logits, bias_vector=bias_vector,
+                        vocab_subset_indices=subset_indices, calibrate=calibrate, calib_logits=cc_logits,
+                        ablation_no_normalization=ablation_no_normalization,
+                        ablation_no_rescale=ablation_no_rescale,)
+                else:
+                    acc,(probs, allpreds, alllabels) = self.evaluate(promptModel, test_dataloader, vocab_subset_indices=subset_indices)
 
         # recover the embeddings
         if embeddings_renormalize==True:
@@ -1425,8 +1661,8 @@ class Experiment():
                 model_bias_output, bias_logits, bias_vector = self.get_continue_prompt_bias(promptModel, prompt_template, prompt, best_ckpt, num_tokens)
             else:
                 raw_template =templates[relation]
-                prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
-                bias_logits, bias_vector = self.get_manual_prompt_bias(self.plm, self.tokenizer, template=prompt_only_tempalte)
+                prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+                bias_logits, bias_vector = self.get_manual_prompt_bias(self.plm, self.tokenizer, template=prompt_only_template)
             
             origin_logits = (torch.norm(bias_vector)*bias_logits).cpu()
             
@@ -1616,17 +1852,32 @@ class Experiment():
             data_paths = [lama_data_path,uni_data_path,lama_whu_data_path]
 
             raw_template =templates[relation]
-            prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+            # for mask language model
+            if self.model_type != "llama":
+                prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+                subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
+                                                    if vocab_subset == "answer_type_tokens" else \
+                                        self.get_common_vocab_indices(self.tokenizer)
+            else:
+                # for auto regressive model like LlamA
+                # NOTE: 考虑末尾字符是不是应该添加一个额外的空白, 我觉得不应该添加
+                # NOTE: 考虑换使用mask ; null 替代无意义输入
+                prompt_only_template = raw_template.replace("[X]", "N/A")
+                # 截断raw_template [Y]以及之后的的内容
+                y_pos = prompt_only_template.find("[Y]")
+                prompt_only_template = prompt_only_template[:y_pos].strip()
+
+                subvocab_tokens_indices = self.get_multi_token_answer_entity_indices(relation, self.tokenizer) \
+                                                    if vocab_subset == "answer_type_tokens" else \
+                                        self.get_multi_token_common_vocab_indices(self.tokenizer)
             
-            subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
-                                                if vocab_subset == "answer_type_tokens" else \
-                                    self.get_common_vocab_indices(self.tokenizer)
-            subvocab_indices_list = subvocab_tokens_indices.tolist()
+            subvocab_indices_list = subvocab_tokens_indices
             bias_tensor = self.generate_model_bias(
-                self.plm, self.tokenizer, prompt_only_tempalte, 
+                self.plm, self.tokenizer, prompt_only_template, 
                 vocab_subset_indices=subvocab_tokens_indices, 
                     return_logits=True)
             
+            # BUG: 对于multi_token的情况, 不能直接使用softmax计算概率值
             bias_probs = torch.softmax(bias_tensor,dim=-1).tolist()
             # For the calucaltion of  KL divergence, we need transform the probs to a distriburion.
             bias_dis = defaultdict(int, zip(subvocab_indices_list,bias_probs))
@@ -1675,73 +1926,83 @@ class Experiment():
                     pbar.set_postfix(postfox)
                     continue
 
-                subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
-                loss = torch.nn.CrossEntropyLoss()
+                # TODO 其他指标暂时不实现
+                if self.model_type=="llama":
+                    TT_CE_before=0
+                    TT_CE_after=0
+                    FF_E =0
+                    FF_E_d = 0
+                    KL_before = 0
+                    KL_after = 0
 
-                equality_mask = torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & torch.eq(torch.tensor(preds_after), torch.tensor(labels))
-                common_acc_index =  torch.where(equality_mask==True)[0]
+                else:
+                    subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
+                    loss = torch.nn.CrossEntropyLoss()
 
-                def cross_entropy(logits, labels):
-                    loss_per_sample = F.cross_entropy(logits, labels, reduction='none')
-                    loss_dict = {}
-                    for label,loss in zip(labels.tolist(), loss_per_sample.tolist()):
-                        if label in loss_dict:
-                            loss_dict[label].append(loss)
-                        else:
-                            loss_dict[label] = [loss]
-                    loss_list = []
-                    for key in loss_dict.keys():
-                        loss_list.append(np.mean(loss_dict[key]))
+                    equality_mask = torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & torch.eq(torch.tensor(preds_after), torch.tensor(labels))
+                    common_acc_index =  torch.where(equality_mask==True)[0]
+
+                    def cross_entropy(logits, labels):
+                        loss_per_sample = F.cross_entropy(logits, labels, reduction='none')
+                        loss_dict = {}
+                        for label,loss in zip(labels.tolist(), loss_per_sample.tolist()):
+                            if label in loss_dict:
+                                loss_dict[label].append(loss)
+                            else:
+                                loss_dict[label] = [loss]
+                        loss_list = []
+                        for key in loss_dict.keys():
+                            loss_list.append(np.mean(loss_dict[key]))
+                        
+                        return np.mean(loss_list)
+
+                    TT_CE_before = 0 if torch.numel(common_acc_index)==0 else cross_entropy(probs_before[common_acc_index], subvocab_labels[common_acc_index])
+                    TT_CE_after = 0 if torch.numel(common_acc_index)==0 else cross_entropy(probs_after[common_acc_index], subvocab_labels[common_acc_index])
+                    # TT_CE_before = cross_entropy(probs_before, subvocab_labels)
+                    # TT_CE_after = cross_entropy(probs_after, subvocab_labels)
+                    # print(TT_CE_before, TT_CE_after)
+                    # print(f"TT CE before: {TT_CE_before} TT CE after {TT_CE_after}")
                     
-                    return np.mean(loss_list)
+                    equality_mask = ~torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & ~torch.eq(torch.tensor(preds_after), torch.tensor(labels))
+                    common_acc_index =  torch.where(equality_mask==True)[0]
+                    # 给定pred和labels, 计算得到分布
 
-                TT_CE_before = 0 if torch.numel(common_acc_index)==0 else cross_entropy(probs_before[common_acc_index], subvocab_labels[common_acc_index])
-                TT_CE_after = 0 if torch.numel(common_acc_index)==0 else cross_entropy(probs_after[common_acc_index], subvocab_labels[common_acc_index])
-                # TT_CE_before = cross_entropy(probs_before, subvocab_labels)
-                # TT_CE_after = cross_entropy(probs_after, subvocab_labels)
-                # print(TT_CE_before, TT_CE_after)
-                # print(f"TT CE before: {TT_CE_before} TT CE after {TT_CE_after}")
-                
-                equality_mask = ~torch.eq(torch.tensor(preds_before), torch.tensor(labels)) & ~torch.eq(torch.tensor(preds_after), torch.tensor(labels))
-                common_acc_index =  torch.where(equality_mask==True)[0]
-                # 给定pred和labels, 计算得到分布
+                    def convert_to_probability(predictions):
+                        total_predictions = len(predictions)
+                        unique_values, counts = np.unique(predictions, return_counts=True)
+                        probabilities = counts / total_predictions
+                        return probabilities
 
-                def convert_to_probability(predictions):
-                    total_predictions = len(predictions)
-                    unique_values, counts = np.unique(predictions, return_counts=True)
-                    probabilities = counts / total_predictions
-                    return probabilities
+                    def entropy(probabilities):
+                        entropy_value = -np.sum(probabilities * np.log2(probabilities))
+                        return entropy_value
 
-                def entropy(probabilities):
-                    entropy_value = -np.sum(probabilities * np.log2(probabilities))
-                    return entropy_value
+                    FF_E = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_before)[common_acc_index].tolist()))
+                    FF_E_d = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_after)[common_acc_index].tolist()))
+                    # FF_E = entropy(convert_to_probability(preds_before))
+                    # FF_E_d = entropy(convert_to_probability(preds_after))
+                    
+                    # FF_CE_before = loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
+                    # FF_CE_after = loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
+                    # print(f"FF CE before: {FF_CE_before} FF CE after {FF_CE_after}")
 
-                FF_E = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_before)[common_acc_index].tolist()))
-                FF_E_d = 0 if common_acc_index==[] else entropy(convert_to_probability(torch.tensor(preds_after)[common_acc_index].tolist()))
-                # FF_E = entropy(convert_to_probability(preds_before))
-                # FF_E_d = entropy(convert_to_probability(preds_after))
-                
-                # FF_CE_before = loss(probs_before[common_acc_index], subvocab_labels[common_acc_index]).item()
-                # FF_CE_after = loss(probs_after[common_acc_index], subvocab_labels[common_acc_index]).item()
-                # print(f"FF CE before: {FF_CE_before} FF CE after {FF_CE_after}")
+                    # for KL divergence and drawing picture, transform the probs to a distribution
+                    num_data = len(preds_before)
+                    # probs_before is actually logit values
+                    probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
+                    probs_dis_after = torch.softmax(probs_after,dim=-1).tolist()
+                    KL_before_list = []
+                    KL_after_list = []
+                    for index in range(num_data):
+                        probs_dis_before_i = probs_dis_before[index]
+                        probs_dis_after_i = probs_dis_after[index]
+                        probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
+                        probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
+                        KL_before_list.append(self.KL_divergence(probs_dis_before_i, bias_dis))
+                        KL_after_list.append(self.KL_divergence(probs_dis_after_i, bias_dis))
 
-                # for KL divergence and drawing picture, transform the probs to a distribution
-                num_data = len(preds_before)
-                # probs_before is actually logit values
-                probs_dis_before = torch.softmax(probs_before,dim=-1).tolist()
-                probs_dis_after = torch.softmax(probs_after,dim=-1).tolist()
-                KL_before_list = []
-                KL_after_list = []
-                for index in range(num_data):
-                    probs_dis_before_i = probs_dis_before[index]
-                    probs_dis_after_i = probs_dis_after[index]
-                    probs_dis_before_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_before_i))
-                    probs_dis_after_i = defaultdict(int, zip(subvocab_indices_list,probs_dis_after_i))
-                    KL_before_list.append(self.KL_divergence(probs_dis_before_i, bias_dis))
-                    KL_after_list.append(self.KL_divergence(probs_dis_after_i, bias_dis))
-
-                KL_before = round(np.mean(KL_before_list),5)
-                KL_after = round(np.mean(KL_after_list),5) 
+                    KL_before = round(np.mean(KL_before_list),5)
+                    KL_after = round(np.mean(KL_after_list),5) 
 
 
                 diff = round(acc_debias - acc_origin,5)
@@ -1769,9 +2030,15 @@ class Experiment():
                 output_save[dataset]["KL_d"].append(KL_after)
 
                 # save all preds
-                obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
-                raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
-                debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
+                if self.model_type=="llama":
+
+                    obj_labels = [self.tokenizer.convert_ids_to_tokens(list(i)) for i in labels]
+                    raw_preds = [self.tokenizer.convert_ids_to_tokens(list(i)) for i in preds_before]
+                    debiased_preds = [self.tokenizer.convert_ids_to_tokens(list(i)) for i in preds_after]
+                else:
+                    obj_labels = self.tokenizer.convert_ids_to_tokens(labels)
+                    raw_preds = self.tokenizer.convert_ids_to_tokens(preds_before)
+                    debiased_preds = self.tokenizer.convert_ids_to_tokens(preds_after)
                 indices = list(range(len(sub_labels)))
                 preds_save[dataset][relation] = {"data":{
                     "index":indices,
@@ -1779,9 +2046,9 @@ class Experiment():
                     "obj_labels":obj_labels,
                     "raw_preds":raw_preds,
                     "debiased_preds":debiased_preds,
-                    "raw_probs":torch.tensor(probs_dis_before,dtype=torch.float16),
-                    "debiased_probs": torch.tensor(probs_dis_after,dtype=torch.float16),
-                    "label_subvocab_ids": subvocab_labels,
+                    "raw_probs":torch.tensor(probs_dis_before,dtype=torch.float16) if self.model_type!="llama" else None,
+                    "debiased_probs": torch.tensor(probs_dis_after,dtype=torch.float16) if self.model_type!="llama" else None,
+                    "label_subvocab_ids": subvocab_labels if self.model_type!="llama" else None,
                     "label_ids": labels,
                     }}
 
@@ -1894,7 +2161,7 @@ class Experiment():
             data_paths = [templama_data_path]
 
             raw_template = "In [year], [X] holds the position of [Y]."
-            prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+            prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
             
             subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer,include_templama_labels=True) \
                                                 if vocab_subset == "answer_type_tokens" else \
@@ -1906,9 +2173,9 @@ class Experiment():
             test_dataset = load_jsonl(os.path.join(self.templama_data_dir,f"{relation}.jsonl"))
             date_list = [i["date"] for i in test_dataset]
             for date in date_list:
-                prompt_only_tempalte_with_year = prompt_only_tempalte.replace("[year]", date)
+                prompt_only_template_with_year = prompt_only_template.replace("[year]", date)
                 bias_tensor = self.generate_model_bias(
-                    self.plm, self.tokenizer, prompt_only_tempalte_with_year, 
+                    self.plm, self.tokenizer, prompt_only_template_with_year, 
                     vocab_subset_indices=subvocab_tokens_indices, 
                         return_logits=True) 
                 
@@ -2373,11 +2640,11 @@ class Experiment():
             uni_data_path = os.path.join(self.wiki_uni_data_dir,f"{relation}.json")
             raw_template =templates[relation]
             if meanless_word=="[MASK]":
-                prompt_only_tempalte = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
+                prompt_only_template = raw_template.replace("[X]",self.tokenizer.mask_token).replace("[Y]", self.tokenizer.mask_token)
             elif meanless_word=="N/A":
-                prompt_only_tempalte = raw_template.replace("[X]", "N/A").replace("[Y]", self.tokenizer.mask_token)
+                prompt_only_template = raw_template.replace("[X]", "N/A").replace("[Y]", self.tokenizer.mask_token)
             elif meanless_word=="":
-                prompt_only_tempalte = raw_template.replace("[X]", "").replace("[Y]", self.tokenizer.mask_token)
+                prompt_only_template = raw_template.replace("[X]", "").replace("[Y]", self.tokenizer.mask_token)
 
             
             subvocab_tokens_indices = self.get_answer_entity_indices(relation, self.tokenizer) \
@@ -2446,7 +2713,7 @@ class Experiment():
 
 
             if not sampling:
-                bias_logits, bias_vector = self.get_manual_prompt_bias(self.plm, self.tokenizer, template=prompt_only_tempalte)
+                bias_logits, bias_vector = self.get_manual_prompt_bias(self.plm, self.tokenizer, template=prompt_only_template)
             else:
                 bias_logits, bias_vector = self.get_prompt_bias_by_sample(promptModel, support_dataloader)
 
@@ -2484,7 +2751,11 @@ class Experiment():
         wrapped = []
         for data in raw_dataset:
             # 加入空格，使得roberta生效
-            obj_token = tokenizer.tokenize(' ' + data["obj_label"])[0]
+            if self.model_type != "llama":
+                obj_token = tokenizer.tokenize(' ' + data["obj_label"])[0]
+            else:
+                # multi token label
+                obj_token = tokenizer.tokenize(data["obj_label"])
             input_example = InputExample(text_a=data["sub_label"]+autoprompt_postfix,label=tokenizer.convert_tokens_to_ids(obj_token))
             wrapped.append(input_example)
 
@@ -2514,6 +2785,187 @@ class Experiment():
         
         return max_tokens_len
 
+
+    def evalute_multi_token(self, promptModel:PromptModel, data_loader:PromptDataLoader, alllabels, vocab_subset_indices=None, debias=False, prompt_only_template=None):
+        promptModel.eval()
+        generation_arguments = {
+            "max_new_tokens": 10,
+            "do_sample": False,
+        }
+        # The following is an unified framework splitting the process of language model into 3 parts
+        # 1. transformer block
+        # 2. transform layer
+        # 3. decoder
+        model = promptModel.plm
+        assert self.model_type=="llama"
+        transformer_blocks = model.model
+        tranform_layer = None
+        decoder = model.lm_head
+        
+
+        def query_next_token(prefix, vocab_subset_indices):
+            # 根据指定前缀，前multi_token的候选单词列表中，找出来所有可能的下一个token
+            # parse prefix from str to a tuple
+            if "," in prefix:
+                cur_prefix = tuple([int(i) for i in prefix.split(",")])
+            else:
+                cur_prefix = (int(prefix),)
+            
+            next_tokens = []
+            for vocab in vocab_subset_indices:
+                if len(vocab) > len(cur_prefix) and vocab[:len(cur_prefix)]== cur_prefix:
+                    next_token = vocab[len(cur_prefix)]
+                    next_tokens.append(str(next_token))
+            
+            return list(set(next_tokens))
+
+        # 从vocab_subset_indices提取出来一个多级typed query对照表
+        # 对于第一个token,使用vocab中的head tokens;在确定了第一个token后, 需要缩小后续的typed query空间
+        # 第一个token的候选空间
+        head_token = list(set([str(i[0]) for i in vocab_subset_indices]))
+        # init是一个特殊标记，用来代表最开始的状态
+        typed_query = [{"":head_token}]
+        max_length = max([len(i) for i in vocab_subset_indices])
+        for i in range(1, max_length):
+            pre_space = typed_query[i-1]
+            # 使用上一级的key和value的组合构建出来下一级的space
+            cur_space = {}
+            for key,values in pre_space.items():
+                for value in values:
+                    new_prefix = ",".join([key,value]) if key!="" else value
+                    next_tokens = query_next_token(new_prefix,vocab_subset_indices)
+                    if next_tokens:
+                        cur_space[new_prefix] = next_tokens
+            typed_query.append(cur_space)
+        # finised typed query space construction 
+        
+
+        allpreds = []
+        probs = None
+        
+        # 对于multi_token的任务，使用生成器来执行任务 
+        for step, inputs in enumerate(data_loader):
+            # 记录每个元素生成的token
+            batch_size = inputs["input_ids"].shape[0]
+            generate_tokens = [""]  *  batch_size
+            
+            inputs =  inputs.cuda()
+            # 处理好输入
+            model_kwargs = ["input_ids","attention_mask"]
+            model_inputs =  { k:inputs[k] for k in inputs.keys() if k in model_kwargs}
+            # 将inputs_id转换成input embeddings，这是用于实现soft prompt，对于手工模板没有影响
+            # BUG:在循环生成的时候，由于只更新了inputs_ids，所以对于soft prompt会存在bug，需要特别处理input embeddings
+            model_inputs = promptModel.template.process_batch(model_inputs)
+            model_inputs["use_cache"] = True
+            
+            
+            
+            # 拆解开实现typed query
+            with torch.no_grad():
+                output_attentions = False
+                output_hidden_states = False
+        
+                new_token_num = 0
+                while new_token_num < max_length:
+                    # forward pass to get next token
+                    # step 1
+                    # 非常重要 给输入添加position_ids
+                    model_inputs = promptModel.plm.prepare_inputs_for_generation(**model_inputs)
+
+                    transformer_outputs = transformer_blocks(
+                        **model_inputs,
+                        return_dict=True,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                    )
+                    # step 2
+                    # NOTE: 暂时只支持llama模型，对于其他模型，需要使用调整object index的位置
+                    # there is no need to use transform layer
+                    # step3
+                    hidden_states = transformer_outputs[0]
+                    # 执行debias操作的地方
+                    if debias:
+                        # hidden_states (batch_size, seq_length, hidden_size)
+                        template_postfix = [eval("["+tokens+"]") for tokens in generate_tokens]
+                        bias_logits, bias_vector =  self.get_manual_prompt_bias(promptModel.plm, self.tokenizer, template=prompt_only_template, template_postfix=template_postfix)
+                        D_T = bias_vector
+                        D_Tx = hidden_states[:,-1,:]
+                        D_debias = D_Tx - D_T
+                        V_debias = D_debias
+                        lm_logits = decoder(V_debias)
+                        next_token_logits = lm_logits
+
+                    else:
+                        
+                        lm_logits = decoder(hidden_states)
+                        # 实现typed query 使用subvocab过滤元素, output next token
+                        next_token_logits = lm_logits[:, -1, :]
+                    # 检索出来当前typed query的answer space
+                    answer_space = typed_query[new_token_num]
+                    
+                    # 对于每个元素，依次执行typed query
+                    next_token_ids = []
+                    for i in range(0, batch_size):
+                        # 当前生成的token序列
+                        previous_gen = generate_tokens[i]
+                        # 如果已经生成了pad_token,说明不需要继续生成了
+                        if previous_gen.split(",")[-1] == str(self.tokenizer.pad_token_id):
+                            next_id = self.tokenizer.pad_token_id
+                        else:
+                            # 根据这个序列来决定下一步的answer space
+                            if previous_gen in answer_space.keys():
+                                vocab_subset = [int(i) for i in answer_space[previous_gen]]
+                                assert vocab_subset != []
+                                assert len(vocab_subset) == len(set(vocab_subset)) # ensure all elements are unique
+                                vocab_subset = torch.as_tensor(vocab_subset).to(lm_logits.device)
+                                max_index = torch.argmax(next_token_logits[i][vocab_subset])
+                                next_id = vocab_subset[max_index].item()
+                            else:
+                                # 该单词生成结束
+                                next_id = self.tokenizer.pad_token_id
+                                
+                        next_token_ids.append(next_id)
+                    
+                        # 更新generate_tokens
+                        if generate_tokens[i]:
+                            generate_tokens[i] = ",".join([generate_tokens[i],str(next_id)])
+                        else:
+                            generate_tokens[i] = str(next_id)
+                    
+                    # 更新inputs_ids
+                    new_token_ids = torch.as_tensor(next_token_ids).unsqueeze(dim=1).to(model_inputs["input_ids"].device)
+                    model_inputs["input_ids"] = torch.cat([model_inputs["input_ids"], new_token_ids], dim=-1)
+                    # 非常重要的一步，给输入添加past_key_values
+                    # 删除掉position_ids, 这是一个自动准备的参数，每次需要重新计算
+                    if "position_ids" in model_inputs.keys():
+                        del model_inputs["position_ids"]
+                    model_inputs = promptModel.plm._update_model_kwargs_for_generation(
+                        transformer_outputs, model_inputs
+                    )
+                    new_token_num += 1
+
+            # parse result
+            batch_outputs = []
+            for i in generate_tokens:
+                tokens = [int(_) for _ in i.split(",")]
+                # del tail pad tokens
+                while tokens[-1]==self.tokenizer.pad_token_id:
+                    tokens.pop()
+                batch_outputs.append(tuple(tokens))
+                
+            allpreds += batch_outputs
+            
+            # BUG: 为了程序能运行，暂时定义probs为一个常数，不代表实际概率
+            if probs == None:
+                probs = lm_logits
+            else:
+                probs = torch.cat((probs,lm_logits),dim=0)
+
+        
+        acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
+        return acc, (probs, allpreds, alllabels)
+            
+                    
 
     def evaluate(self, promptModel:PromptModel, data_loader:PromptDataLoader,
                 bias_logits=None, bias_vector=None, 
@@ -2557,6 +3009,10 @@ class Experiment():
             transformer_blocks = model.roberta
             tranform_layer = nn.Sequential(model.lm_head.dense, nn.GELU(), model.lm_head.layer_norm)
             decoder = model.lm_head.decoder
+        elif isinstance(model, LlamaForCausalLM):
+            transformer_blocks = model.model
+            tranform_layer = None
+            decoder = model.lm_head
         
         if soft_tempalte_ckpt:
             soft_embeds = torch.load(soft_tempalte_ckpt)
@@ -2773,12 +3229,12 @@ class Experiment():
 if __name__ == '__main__':
     # An example
     exp = Experiment()
-    exp.set_model("bert","bert-base-cased")
+    exp.set_model("llama","/mnt/data/users/xuziyang/huggingface_model/shares/llama2-convert-7b-hf")
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     # exp.relations = ["P140","P413"]
     exp.relations = ["P463"]
-    # exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=False,filter_biased_token_nums=-1)
-    exp.experiment_renormal_vector_debias_for_continue_prompt(filter_biased_token_nums=0, repeat_times=1)
+    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=False,filter_biased_token_nums=0)
+    # exp.experiment_renormal_vector_debias_for_continue_prompt(filter_biased_token_nums=0, repeat_times=1)
 
     # exp.load_output("/mnt/code/users/xuziyang/PromptBias/results/filter_out_4_biased_tokens/bert-base-cased/common_vocab_cased/typed_querying/LAMA_result.json")
     # exp.print_output()

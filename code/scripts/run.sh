@@ -1,5 +1,5 @@
 MODEL_TYPE=${1:-bert}
-MODEL_NAME=${2:-bert-base-cased}
+FULL_MODEL_NAME=${2:-bert-base-cased}
 INTER_VOCAB=${3:-common_vocab_cased}
 PROBE_METHOD=${4:-typed_querying}
 PROMPT=${5:-LAMA}
@@ -12,6 +12,19 @@ ABLATION_NO_NORMALIZATION=${11:-False}
 ABLATION_NO_RESCALE=${12:-False}
 
 WORKSPACE=/mnt/code/users/xuziyang/PromptBias
+
+
+# 从MODEL_NAME中提取出来合适的字段
+# 原始字符串
+
+# 使用awk提取目标片段
+if [[ $FULL_MODEL_NAME == *"/"* ]]; then
+    MODEL_NAME=$(echo "$FULL_MODEL_NAME" | awk -F'/' '{print $NF}')
+else
+    MODEL_NAME=$FULL_MODEL_NAME
+fi
+
+
 
 # 获取calibrate 环境变量
 if [ -z "$CALIBRATE" ] || [ "$CALIBRATE" = "False" ]; then
@@ -70,7 +83,7 @@ cd ${WORKSPACE}/code
 echo "使用显卡${CUDA_DEVICE} 执行如下命令: "
 echo "python script.py \
     --model_type $MODEL_TYPE \
-    --model_name $MODEL_NAME \
+    --model_name $FULL_MODEL_NAME \
     --prompt ${PROMPT} \
     --do_debias $DO_DEBIAS \
     --eval_bias $EVAL_BIAS \
@@ -88,7 +101,7 @@ echo "python script.py \
 
 python script.py \
     --model_type $MODEL_TYPE \
-    --model_name $MODEL_NAME \
+    --model_name $FULL_MODEL_NAME \
     --prompt ${PROMPT} \
     --do_debias $DO_DEBIAS \
     --eval_bias $EVAL_BIAS \
