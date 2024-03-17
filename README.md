@@ -1,6 +1,6 @@
 ﻿# MitigatePromptBias
 
-This is the PyTorch implementation of the paper: "Take Care of Your Prompt Bias: Investigating and Mitigating the Prompt Bias in Factual Knowledge Extraction"
+This is the PyTorch implementation of the paper: "<b><i>Take Care of Your Prompt Bias: Investigating and Mitigating the Prompt Bias in Factual Knowledge Extraction</i></b>" in The International Conference on Computational Linguistics (<b>COLING 2024</b>).
 
 ## Environment Configuration
 
@@ -22,3 +22,13 @@ To reproduce the experiment results, please run with `bash ./code/scripts/debias
 - add a concise explanation for the code construction and function.
 - delete unnecessary source code files.
 
+## Citation
+If you find this work helpful, please consider citing as follows:  
+```ruby
+@inproceedings{xu2024promptbias,
+  title={Take Care of Your Prompt Bias: Investigating and Mitigating the Prompt Bias in Factual Knowledge Extraction},
+  author={Xu, Ziyang and Peng, Keqin and Ding, Liang and Tao, Dacheng and Lu, Xiliang},
+  booktitle={Proc. of COLING},
+  year={2024}
+}
+```
