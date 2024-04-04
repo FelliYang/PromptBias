@@ -4,11 +4,13 @@ This is the PyTorch implementation of the paper: "<b><i>Take Care of Your Prompt
 
 ## Environment Configuration
 
-1. clone this code and create a new conda env named `PromptBias` using the `env.yaml` file by: `conda env create -f env.yaml`
+1. Clone this code by: `git clone --recursive https://github.com/FelliYang/PromptBias.git`, it will recursively clone my forked version of the OpenPrompt library, where I implement the inference code for LLama2 models.
 
-2. download the dataset from the [link](https://gitee.com/FelliYang/factual-probing-dataset.git) and unzip it into the ./data directory.
+2. Clone datasets from the [link](https://gitee.com/FelliYang/factual-probing-dataset.git) and move them into the `./data` directory.
 
-3. Install the OpenPrompt library locally using my forked version in [OpenPrompt_Llama2](https://github.com/FelliYang/OpenPrompt), where I implement the inference code for LLama2 models. `cd OpenPrompt; pip install -e .`
+3. Create a new conda env named `PromptBias` using the `./env.yaml` file by: `conda env create -f env.yaml`
+
+4. Install the OpenPrompt library locally by: `cd OpenPrompt; pip install -e .`
 
 Now the environment is OK!
 
