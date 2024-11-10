@@ -305,7 +305,7 @@ class Experiment():
             if self.model_type=="roberta":
                 tokens = tokenizer.tokenize(' ' + str(word))
             elif self.model_type=="llama":
-                # 对于lama模型,会默认认为有空白符号的prefix '_' 可以理解成lama在句子的开头标记<s>和第一个单词之间一定会加一个空白
+                # 对于lama模型, 会默认认为有空白符号的prefix '_' 可以理解成lama在句子的开头标记<s>和第一个单词之间一定会加一个空白
                 tokens = tokenizer.tokenize(str(word))
             else:
                 # 对于其他模型,会直接忽视空白
@@ -1217,8 +1217,9 @@ class Experiment():
                 tokenizer_wrapper_class=WrapperClass, max_seq_length=max_tokens_len, 
                 batch_size=16,shuffle=False, padding_side=self.tokenizer.padding_side)
             
-            # extract labels from test_dataloader
-            dataset_labels = [tuple(item[1]["label"])  for item in test_dataloader.wrapped_dataset]
+            # for MultiToken: extract labels from test_dataloader
+            if MultiToken:
+                dataset_labels = [tuple(item[1]["label"])  for item in test_dataloader.wrapped_dataset]
 
             promptModel = PromptModel(
                 template = prompt_template,
@@ -1871,7 +1872,7 @@ class Experiment():
                                                     if vocab_subset == "answer_type_tokens" else \
                                         self.get_multi_token_common_vocab_indices(self.tokenizer)
             
-            subvocab_indices_list = subvocab_tokens_indices
+            subvocab_indices_list = subvocab_tokens_indices.tolist()
             bias_tensor = self.generate_model_bias(
                 self.plm, self.tokenizer, prompt_only_template, 
                 vocab_subset_indices=subvocab_tokens_indices, 
@@ -1936,6 +1937,7 @@ class Experiment():
                     KL_after = 0
 
                 else:
+                    
                     subvocab_labels = torch.tensor([subvocab_indices_list.index(l) for l in labels]).cuda()
                     loss = torch.nn.CrossEntropyLoss()
 
@@ -3229,11 +3231,14 @@ class Experiment():
 if __name__ == '__main__':
     # An example
     exp = Experiment()
-    exp.set_model("llama","/mnt/data/users/xuziyang/huggingface_model/shares/llama2-convert-7b-hf")
+    # exp.set_model("llama","/mnt/data/users/xuziyang/huggingface_model/shares/llama2-convert-7b-hf")
+    exp.set_model("bert","bert-base-cased")
+    print(exp.lama_template["P140"])
+    exit(-1)
     exp.set_common_vocab(exp.work_dir + "/common_vocabs/common_vocab_cased.txt")
     # exp.relations = ["P140","P413"]
     exp.relations = ["P463"]
-    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=False,filter_biased_token_nums=0)
+    exp.experiment_renormal_vector_debais_for_manual_prompt(calibrate=True, filter_biased_token_nums=0)
     # exp.experiment_renormal_vector_debias_for_continue_prompt(filter_biased_token_nums=0, repeat_times=1)
 
     # exp.load_output("/mnt/code/users/xuziyang/PromptBias/results/filter_out_4_biased_tokens/bert-base-cased/common_vocab_cased/typed_querying/LAMA_result.json")

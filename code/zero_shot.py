@@ -24,14 +24,14 @@ parser.add_argument("--plm_eval_mode", action="store_true")
 parser.add_argument("--model", type=str, default='roberta')
 parser.add_argument("--model_name_or_path", default='roberta-large')
 parser.add_argument("--result_file", type=str, default="sfs_scripts/results_fewshot_manual_kpt.txt")
-parser.add_argument("--openprompt_path", type=str, default="/workspace/data/users/xuziyang/code/PromptBias/TruelyKnow/OpenPrompt")
+parser.add_argument("--openprompt_path", type=str, default="/opt/data/private/PromptBias/OpenPrompt")
 
 # parser.add_argument("--verbalizer", type=str)
 parser.add_argument("--nocut", action="store_true")
 parser.add_argument("--filter", default="none", type=str)
-parser.add_argument("--template_id", type=int)
+parser.add_argument("--template_id", type=int, default=0)
 parser.add_argument("--max_token_split", default=-1, type=int)
-parser.add_argument("--dataset",type=str)
+parser.add_argument("--dataset",type=str,default="agnews")
 parser.add_argument("--write_filter_record", action="store_true")
 
 parser.add_argument("--sample_num",type=int, default=200)
@@ -64,7 +64,7 @@ if args.dataset == "agnews":
     scriptformat = "txt"
     cutoff=0.5 if (not args.nocut) else 0.0
     max_seq_l = 128
-    batch_s = 30
+    batch_s = 256
 elif args.dataset == "dbpedia":
     # raw_dataset = load_from_disk(f"{args.openprompt_path}/datasets/TextClassification/dbpedia")
     dataset['train'] = DBpediaProcessor().get_train_examples(f"{args.openprompt_path}/datasets/TextClassification/dbpedia/")
@@ -74,7 +74,7 @@ elif args.dataset == "dbpedia":
     scriptformat = "txt"
     cutoff=0.5 if (not args.nocut) else 0.0
     max_seq_l = 128
-    batch_s = 30
+    batch_s = 256
 elif args.dataset == "yahoo":
     raw_dataset = load_from_disk(f"{args.openprompt_path}/datasets/TextClassification/yahoo_answers_topics")
     dataset['train'] = list(map(YahooAnswersTopicsProcessor().transform, raw_dataset["train"]))
@@ -84,7 +84,7 @@ elif args.dataset == "yahoo":
     scriptformat = "json"
     cutoff=0.5 if (not args.nocut) else 0.0
     max_seq_l = 128
-    batch_s = 30
+    batch_s = 256
 elif args.dataset == "imdb":
     # raw_dataset = load_from_disk(f"{args.openprompt_path}/datasets/TextClassification/imdb")
     dataset['train'] = ImdbProcessor().get_train_examples(f"{args.openprompt_path}/datasets/TextClassification/imdb/")
@@ -94,7 +94,7 @@ elif args.dataset == "imdb":
     scriptformat = "txt"
     cutoff=0
     max_seq_l = 512
-    batch_s = 5
+    batch_s = 256
 elif args.dataset == "amazon":
     # raw_dataset = load_from_disk(f"{args.openprompt_path}/datasets/TextClassification/amazon")
     dataset['train'] = AmazonProcessor().get_train_examples(f"{args.openprompt_path}/datasets/TextClassification/amazon/")
@@ -148,11 +148,13 @@ def find_mask_id(content_free_template):
 with open(f"{args.openprompt_path}/scripts/{scriptsbase}/manual_template.txt", "r") as f:
     raw_template = f.readlines()[args.template_id]
 wandb.init(
-    project="debais_vs_calibration",
+    project="RE_debais_vs_calibration",
     name=f"{args.dataset}_TemplateID_{args.template_id}",
     config={
         "dataset":args.dataset,
         "promptType": "manual",
+        "modelType": args.model,
+        "modelName": args.model_name_or_path,
         "templateID": args.template_id,
         "template": raw_template,
         "contentFreeType": "mask",
@@ -221,7 +223,7 @@ assert '{' not in content_free_template
 bias_logits, bias_vector = exp.get_manual_prompt_bias(exp.plm, exp.tokenizer,template=content_free_template, object_index=mask_id)
 cc_logits = torch.norm(bias_vector)*bias_logits
 cc_logits = cc_logits.to(prompt_model.device)
-acc_calibration_tra, _ = exp.evaluate(prompt_model,test_dataloader, calibration=True, calib_logits=cc_logits)
+acc_calibration_tra, _ = exp.evaluate(prompt_model,test_dataloader, calibrate=True, calib_logits=cc_logits)
 print(acc_calibration_tra)
 wandb.summary["acc_calibration_tra"] = acc_calibration_tra
 
@@ -239,7 +241,7 @@ for i in range(3):
         batch_size=batch_s,shuffle=False, teacher_forcing=False, predict_eos_token=False,
         truncate_method="tail")
     cc_logits = exp.calibrate(prompt_model, support_dataloader).mean(dim=0)
-    acc, _ = exp.evaluate(prompt_model,test_dataloader, calibration=True, calib_logits=cc_logits)
+    acc, _ = exp.evaluate(prompt_model,test_dataloader, calibrate=True, calib_logits=cc_logits)
     acc_calibration_sample.append(acc)
 print(acc_calibration_sample)
 for i in range(3):
